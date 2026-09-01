@@ -23,7 +23,11 @@ namespace ClassHub_API
 
             var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
             builder.Services.AddDbContext<AppDbContext>(options =>
-                options.UseMySql(connectionString, ServerVersion.AutoDetect(connectionString)));
+                options.UseMySql(
+                    builder.Configuration.GetConnectionString("DefaultConnection"),
+                    ServerVersion.AutoDetect(builder.Configuration.GetConnectionString("DefaultConnection"))
+                ));
+
 
             var jwtSettings = builder.Configuration.GetSection("JwtSettings");
             var secretKey = jwtSettings["SecretKey"];
@@ -47,6 +51,7 @@ namespace ClassHub_API
                 };
             });
 
+            builder.Services.AddSignalR();
             builder.Services.AddCors(options =>
             {
                 options.AddPolicy("AllowFrontend", policy =>
@@ -61,18 +66,18 @@ namespace ClassHub_API
             builder.WebHost.UseUrls("http://0.0.0.0:5146");
 
             var app = builder.Build();
-            
+
 
             if (app.Environment.IsDevelopment())
             {
                 app.UseSwagger();
                 app.UseSwaggerUI();
             }
-          
+
             app.UseCors("AllowFrontend");
             app.UseAuthentication();
             app.UseAuthorization();
-
+            app.MapHub<ClassHub_API.Hubs.CabinetHub>("/hub/cabinet");
             app.MapControllers();
 
             app.Run();

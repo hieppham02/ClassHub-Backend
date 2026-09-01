@@ -1,8 +1,11 @@
 ﻿using ClassHub_API.Data;
 using ClassHub_API.DTOs;
+using ClassHub_API.Hubs;
 using ClassHub_API.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.SignalR;
+using Microsoft.EntityFrameworkCore;
 using Newtonsoft.Json;
 using System.Security.Claims;
 
@@ -11,15 +14,20 @@ namespace ClassHub_API.Controllers
     [Route("api/cabinet")]
     [ApiController]
     [Authorize]
-    public class CabinetController : Controller
+    public class CabinetController : ControllerBase
     {
         private readonly AppDbContext _context;
         private readonly IMqttService _mqttService;
+        private readonly IHubContext<CabinetHub> _hubContext;
 
-        public CabinetController(AppDbContext context, IMqttService mqttService)
+        public CabinetController(
+            AppDbContext context,
+            IMqttService mqttService,
+            IHubContext<CabinetHub> hubContext)
         {
             _context = context;
             _mqttService = mqttService;
+            _hubContext = hubContext;
         }
 
         [HttpPost("open-door/{id}")]
@@ -28,12 +36,13 @@ namespace ClassHub_API.Controllers
             var maSv = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
             if (string.IsNullOrEmpty(maSv)) return Unauthorized();
 
-            var phieu = _context.phieu_muon.FirstOrDefault(p => p.id == id && p.ma_sv == maSv);
+            var phieu = await _context.phieu_muon
+                .FirstOrDefaultAsync(p => p.id == id && (p.ma_sv == maSv || p.ma_sv_uy_quyen == maSv));
             if (phieu == null) return NotFound(new { message = "Không tìm thấy phiếu mượn!" });
 
             if (phieu.trang_thai == "COMPLETED" || phieu.trang_thai == "CANCELED")
             {
-                return BadRequest(new { message = "Phòng này đã trả, không thể mở tủ!" });
+                return BadRequest(new { message = "Phòng này đã trả hoặc đã hủy, không thể mở tủ!" });
             }
 
             if (phieu.otp != request.Otp)
@@ -41,17 +50,40 @@ namespace ClassHub_API.Controllers
                 return BadRequest(new { message = "Mã OTP không chính xác!" });
             }
 
-            string topic = $"tu_thiet_bi/ACTION";
-            var Obj = new
+            // Cập nhật phiếu mượn
+            if (phieu.trang_thai == "PENDING")
             {
-                id = phieu.id,
-                room = phieu.ma_phong,
-                action = "open"
-                
-            };
-            string payload = JsonConvert.SerializeObject(Obj);
+                phieu.trang_thai = "ACTIVE";
+                phieu.thoi_gian_nhan = DateTime.Now;
+            }
+            phieu.is_cabinet_open = true;
 
+            // Cập nhật bảng tủ IoT
+            var cabinet = await _context.thiet_bi_iot.FirstOrDefaultAsync(c => c.ma_phong == phieu.ma_phong);
+            if (cabinet != null)
+            {
+                cabinet.trang_thai_khoa = "UNLOCKED";
+                cabinet.lan_cuoi_online = DateTime.Now;
+            }
+
+            await _context.SaveChangesAsync();
+
+            // Gửi lệnh MQTT mở khóa xuống ESP32
+            string topic = "tu_thiet_bi/ACTION";
+            var obj = new { id = phieu.id, room = phieu.ma_phong, action = "open" };
+            string payload = JsonConvert.SerializeObject(obj);
             await _mqttService.PublishAsync(topic, payload);
+
+            // Bắn SignalR realtime
+            await _hubContext.Clients.All.SendAsync("CabinetStatusChanged", new
+            {
+                roomId = phieu.ma_phong,
+                isOpen = true,
+                doorCondition = "Mở",
+                isOnline = true,
+                lockStatus = "UNLOCKED",
+                timestamp = DateTime.Now.ToString("HH:mm:ss")
+            });
 
             return Ok(new { message = "Gửi yêu cầu mở cửa thành công!" });
         }
