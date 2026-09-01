@@ -8,11 +8,11 @@ namespace ClassHub_API.Services
 {
     public class CabinetStatusPayload
     {
-        public string? id { get; set; }           // ID phiếu mượn (nếu có)
-        public string room { get; set; } = null!; // Mã phòng (Bắt buộc, VD: "DTD201", "EAUT101")
-        public bool isOpen { get; set; }          // Cửa đang Mở (true) hay Đóng (false)
+        public string? id { get; set; }
+        public string room { get; set; } = null!;
+        public bool isOpen { get; set; }
         public bool? isOnline { get; set; } = true;
-        public string? lockState { get; set; }    // "LOCKED" | "UNLOCKED"
+        public string? lockState { get; set; }
     }
 
     public class BackgroundServices : BackgroundService
@@ -35,23 +35,38 @@ namespace ClassHub_API.Services
         {
             await Task.Delay(2000, stoppingToken);
 
-            // Subscribe lắng nghe các topic trạng thái từ ESP32
-            await _mqttService.SubscribeAsync("tu_thiet_bi/STATUS", HandleMqttStatusMessage);
-            await _mqttService.SubscribeAsync("classhub/cabinet/+/event", HandleMqttStatusMessage);
-            await _mqttService.SubscribeAsync("classhub/cabinet/+/heartbeat", HandleMqttStatusMessage);
-            await _mqttService.SubscribeAsync("classhub/cabinet/+/status", HandleMqttStatusMessage);
+            // Đăng ký lắng nghe toàn bộ các tin nhắn gửi lên từ IoT
+            await _mqttService.SubscribeAsync("iot/cabinet/+/status", HandleMqttStatusMessage);
+            await _mqttService.SubscribeAsync("iot/cabinet/+/heartbeat", HandleMqttStatusMessage);
+            await _mqttService.SubscribeAsync("tu_thiet_bi/STATUS", HandleMqttStatusMessage); // Backward compatibility
+
+            Console.WriteLine(">> [BackgroundService] Da khoi chay MQTT Listener voi tien to 'iot/'");
+
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                try
+                {
+                    await CheckOfflineCabinetsAsync();
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("[Watchdog Error] " + ex.Message);
+                }
+
+                await Task.Delay(5000, stoppingToken);
+            }
         }
 
         private async void HandleMqttStatusMessage(string topic, string payload)
         {
-            Console.WriteLine($"[MQTT Received] Topic: {topic} | Payload: {payload}");
+            Console.WriteLine($"[MQTT Recv -> {topic}] {payload}");
 
             try
             {
                 var data = JsonConvert.DeserializeObject<CabinetStatusPayload>(payload);
                 if (data == null) return;
 
-                // Nếu ESP32 gửi theo topic dạng classhub/cabinet/DTD201/event -> tách lấy room
+                // Tách lấy mã phòng từ topic (VD: iot/cabinet/DTD201/status -> DTD201)
                 if (string.IsNullOrWhiteSpace(data.room) && topic.Contains("/"))
                 {
                     var parts = topic.Split('/');
@@ -63,16 +78,14 @@ namespace ClassHub_API.Services
                 using var scope = _scopeFactory.CreateScope();
                 var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
 
-                // 1. CẬP NHẬT TRẠNG THÁI PHẦN CỨNG (thiet_bi_iot)
                 var cabinet = await dbContext.thiet_bi_iot.FirstOrDefaultAsync(c => c.ma_phong == data.room);
                 if (cabinet != null)
                 {
                     cabinet.lan_cuoi_online = DateTime.Now;
-                    cabinet.trang_thai_mang = data.isOnline ?? true;
-                    cabinet.trang_thai_khoa = data.isOpen ? "UNLOCKED" : (data.lockState ?? "LOCKED");
+                    cabinet.trang_thai_mang = true;
+                    cabinet.trang_thai_khoa = data.isOpen ? "UNLOCKED" : "LOCKED";
                 }
 
-                // 2. CẬP NHẬT PHIẾU MƯỢN HIỆN HÀNH (phieu_muon)
                 var activeBooking = await dbContext.phieu_muon
                     .Where(p => p.ma_phong == data.room && (p.trang_thai == "PENDING" || p.trang_thai == "ACTIVE" || p.trang_thai == "IN_USE"))
                     .OrderByDescending(p => p.thoi_gian_tao)
@@ -81,8 +94,6 @@ namespace ClassHub_API.Services
                 if (activeBooking != null)
                 {
                     activeBooking.is_cabinet_open = data.isOpen;
-
-                    // Nếu sinh viên đang ở trạng thái PENDING mà mở tủ lấy đồ -> Đổi sang ACTIVE
                     if ((activeBooking.trang_thai == "PENDING" || activeBooking.trang_thai == "IN_USE") && data.isOpen)
                     {
                         activeBooking.trang_thai = "ACTIVE";
@@ -94,22 +105,70 @@ namespace ClassHub_API.Services
                 }
 
                 await dbContext.SaveChangesAsync();
-                Console.WriteLine($"[DB Synced] Phòng {data.room}: Cửa={(data.isOpen ? "Mở" : "Đóng")} | Mạng=Online");
 
-                // 3. ĐẨY SIGNALR REALTIME XUỐNG FRONTEND VUE 3
+                string displayStatus = (cabinet?.trang_thai_khoa == "ERROR") ? "Bảo trì" : (activeBooking != null ? "Đang mượn" : "Trống");
+                string borrowerName = activeBooking?.MaSvNavigation?.ho_ten != null
+                    ? $"{activeBooking.MaSvNavigation.ho_ten} ({activeBooking.ma_sv})"
+                    : "---";
+
                 await _hubContext.Clients.All.SendAsync("CabinetStatusChanged", new
                 {
                     roomId = data.room,
                     isOpen = data.isOpen,
                     doorCondition = data.isOpen ? "Mở" : "Đóng",
-                    isOnline = data.isOnline ?? true,
-                    lockStatus = data.isOpen ? "UNLOCKED" : "LOCKED",
-                    timestamp = DateTime.Now.ToString("HH:mm:ss")
+                    isOnline = true,
+                    status = displayStatus,
+                    borrower = borrowerName,
+                    lastOnline = DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss")
                 });
             }
             catch (Exception ex)
             {
-                Console.WriteLine("Lỗi xử lý MQTT Background: " + ex.Message);
+                Console.WriteLine("[MQTT Process Error] " + ex.Message);
+            }
+        }
+
+        private async Task CheckOfflineCabinetsAsync()
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+            var onlineCabinets = await dbContext.thiet_bi_iot
+                .Where(c => c.trang_thai_mang == true)
+                .ToListAsync();
+
+            var now = DateTime.Now;
+            bool hasChange = false;
+
+            foreach (var cab in onlineCabinets)
+            {
+                double elapsedSeconds = cab.lan_cuoi_online.HasValue
+                    ? (now - cab.lan_cuoi_online.Value).TotalSeconds
+                    : 9999;
+
+                if (elapsedSeconds > 30)
+                {
+                    cab.trang_thai_mang = false;
+                    hasChange = true;
+
+                    Console.WriteLine($">> [Watchdog Timeout] Tu {cab.ma_phong} da OFFLINE (Mat tin hieu {(int)elapsedSeconds}s)");
+
+                    await _hubContext.Clients.All.SendAsync("CabinetStatusChanged", new
+                    {
+                        roomId = cab.ma_phong,
+                        isOpen = cab.trang_thai_khoa == "UNLOCKED",
+                        doorCondition = cab.trang_thai_khoa == "UNLOCKED" ? "Mở" : "Đóng",
+                        isOnline = false,
+                        lockStatus = cab.trang_thai_khoa,
+                        status = "Bảo trì",
+                        timestamp = DateTime.Now.ToString("HH:mm:ss")
+                    });
+                }
+            }
+
+            if (hasChange)
+            {
+                await dbContext.SaveChangesAsync();
             }
         }
     }

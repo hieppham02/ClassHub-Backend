@@ -54,12 +54,12 @@ namespace ClassHub_API
             builder.Services.AddSignalR();
             builder.Services.AddCors(options =>
             {
-                options.AddPolicy("AllowFrontend", policy =>
+                options.AddPolicy("CorsPolicy", policy =>
                 {
-                    policy
-                        .AllowAnyOrigin()
-                        .AllowAnyHeader()
-                        .AllowAnyMethod();
+                    policy.SetIsOriginAllowed(origin => true)
+                          .AllowAnyHeader()
+                          .AllowAnyMethod()
+                          .AllowCredentials();
                 });
             });
 
@@ -74,11 +74,11 @@ namespace ClassHub_API
                 app.UseSwaggerUI();
             }
 
-            app.UseCors("AllowFrontend");
+            app.UseCors("CorsPolicy");
             app.UseAuthentication();
             app.UseAuthorization();
-            app.MapHub<ClassHub_API.Hubs.CabinetHub>("/hub/cabinet");
             app.MapControllers();
+            app.MapHub<ClassHub_API.Hubs.CabinetHub>("/hub/cabinet");
 
             app.Run();
         }

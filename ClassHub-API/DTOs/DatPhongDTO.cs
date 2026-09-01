@@ -5,5 +5,6 @@
         public string MaPhong { get; set; }
         public string NgayMuon { get; set; }
         public int CaMuon { get; set; }
+        public string VaiTro { get; set; }
     }
 }

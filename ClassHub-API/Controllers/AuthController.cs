@@ -2,6 +2,7 @@
 using ClassHub_API.DTOs;
 using ClassHub_API.Interfaces;
 using ClassHub_API.Models;
+using ClassHub_API.Services;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using BCryptNet = BCrypt.Net.BCrypt;
@@ -76,16 +77,14 @@ namespace ClassHub_API.Controllers
 
             try
             {
-                var ipAddress = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "Localhost";
-                var userAgent = Request.Headers["User-Agent"].ToString();
                 var log = new NhatKyHeThong
                 {
                     ma_sv = user.ma_sv,
                     hanh_dong = "DANG_NHAP",
-                    chi_tiet = $"Đăng nhập thành công với vai trò {user.vai_tro}",
+                    chi_tiet = $"{user.vai_tro} Đăng nhập thành công ",
                     thoi_gian = DateTime.Now,
-                    ip_address = ipAddress,
-                    user_agent = ParseOSFromUserAgent(userAgent),
+                    ip_address = OtherHelper.GetClientIp(HttpContext),
+                    user_agent = OtherHelper.GetClientOs(Request),
                 };
                 _context.nhat_ky_he_thong.Add(log);
                 await _context.SaveChangesAsync();
@@ -146,23 +145,6 @@ namespace ClassHub_API.Controllers
             await _context.SaveChangesAsync();
 
             return Ok(new { message = "Đăng ký tài khoản thành công! Vui lòng đăng nhập." });
-        }
-
-        public static string ParseOSFromUserAgent(string userAgent)
-        {
-            if (string.IsNullOrWhiteSpace(userAgent))
-                return "Unknown";
-
-            if (userAgent.Contains("Windows NT 10.0")) return "Windows 10/11";
-            if (userAgent.Contains("Windows NT 6.3")) return "Windows 8.1";
-            if (userAgent.Contains("Windows NT 6.2")) return "Windows 8";
-            if (userAgent.Contains("Windows NT 6.1")) return "Windows 7";
-            if (userAgent.Contains("Mac OS X")) return "macOS";
-            if (userAgent.Contains("Android")) return "Android";
-            if (userAgent.Contains("iPhone") || userAgent.Contains("iPad")) return "iOS";
-            if (userAgent.Contains("Linux")) return "Linux";
-
-            return "Other";
-        }
+        }       
     }
 }

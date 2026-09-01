@@ -95,11 +95,14 @@ namespace ClassHub_API.Controllers
             phieu.otp_expires_at = DateTime.Now.AddMinutes(30);
             await _context.SaveChangesAsync();
 
-            string topic = "tu_thiet_bi/OTP";
+            // GỬI OTP MỚI: backend/cabinet/{ma_phong}/otp
+            string topic = $"backend/cabinet/{phieu.ma_phong}/otp";
             var obj = new { id = phieu.id, room = phieu.ma_phong, otp = newOtp };
             string payload = JsonConvert.SerializeObject(obj);
 
             await _mqttService.PublishAsync(topic, payload);
+            await _mqttService.PublishAsync("tu_thiet_bi/OTP", payload);
+
             return Ok(new { message = "Đã cấp lại mã OTP mới cho thiết bị!" });
         }
 

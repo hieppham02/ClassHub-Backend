@@ -5,14 +5,14 @@ using Microsoft.EntityFrameworkCore;
 
 namespace ClassHub_API.Controllers
 {
-    [Route("api/admin/statistics")]
+    [Route("api/admin/dashboard")]
     [ApiController]
     [Authorize]
-    public class AdminStatisticsController : ControllerBase
+    public class AdminDashboardController : ControllerBase
     {
         private readonly AppDbContext _context;
 
-        public AdminStatisticsController(AppDbContext context)
+        public AdminDashboardController(AppDbContext context)
         {
             _context = context;
         }

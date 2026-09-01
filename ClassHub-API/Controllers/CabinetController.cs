@@ -50,7 +50,6 @@ namespace ClassHub_API.Controllers
                 return BadRequest(new { message = "Mã OTP không chính xác!" });
             }
 
-            // Cập nhật phiếu mượn
             if (phieu.trang_thai == "PENDING")
             {
                 phieu.trang_thai = "ACTIVE";
@@ -58,7 +57,6 @@ namespace ClassHub_API.Controllers
             }
             phieu.is_cabinet_open = true;
 
-            // Cập nhật bảng tủ IoT
             var cabinet = await _context.thiet_bi_iot.FirstOrDefaultAsync(c => c.ma_phong == phieu.ma_phong);
             if (cabinet != null)
             {
@@ -68,13 +66,14 @@ namespace ClassHub_API.Controllers
 
             await _context.SaveChangesAsync();
 
-            // Gửi lệnh MQTT mở khóa xuống ESP32
-            string topic = "tu_thiet_bi/ACTION";
+            // GỬI LỆNH MỞ TỦ ĐẾN TOPIC: backend/cabinet/{ma_phong}/action
+            string topic = $"backend/cabinet/{phieu.ma_phong}/action";
             var obj = new { id = phieu.id, room = phieu.ma_phong, action = "open" };
             string payload = JsonConvert.SerializeObject(obj);
-            await _mqttService.PublishAsync(topic, payload);
 
-            // Bắn SignalR realtime
+            await _mqttService.PublishAsync(topic, payload);
+            await _mqttService.PublishAsync("tu_thiet_bi/ACTION", payload);
+
             await _hubContext.Clients.All.SendAsync("CabinetStatusChanged", new
             {
                 roomId = phieu.ma_phong,
