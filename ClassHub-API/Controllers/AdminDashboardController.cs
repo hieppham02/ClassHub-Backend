@@ -1,4 +1,5 @@
 ﻿using ClassHub_API.Data;
+using ClassHub_API.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -7,7 +8,7 @@ namespace ClassHub_API.Controllers
 {
     [Route("api/admin/dashboard")]
     [ApiController]
-    [Authorize]
+    [Authorize(Roles = "ADMIN")]
     public class AdminDashboardController : ControllerBase
     {
         private readonly AppDbContext _context;
@@ -161,11 +162,11 @@ namespace ClassHub_API.Controllers
 
                 string actionText = log.hanh_dong switch
                 {
-                    "TAO_PHIEU_MUON" => "Đăng ký mượn phòng",
-                    "MO_TU_IOT" => "Mở tủ nhận thiết bị",
-                    "TRA_PHONG" => "Trả phòng & thiết bị",
-                    "DANG_NHAP" => "Đăng nhập hệ thống",
-                    "KHOA_TAI_KHOAN" => "Khóa tài khoản vi phạm",
+                    nameof(LogAction.TAO_PHIEU_MUON) => "Đăng ký mượn phòng",
+                    nameof(LogAction.MO_TU_IOT) => "Mở tủ nhận thiết bị",
+                    nameof(LogAction.TRA_PHONG) => "Trả phòng & thiết bị",
+                    nameof(LogAction.DANG_NHAP) => "Đăng nhập hệ thống",
+                    nameof(LogAction.KHOA_TAI_KHOAN) => "Khóa tài khoản vi phạm",
                     _ => log.hanh_dong
                 };
 

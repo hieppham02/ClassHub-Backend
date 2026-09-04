@@ -1,6 +1,15 @@
 ﻿namespace ClassHub_API.Services
 {
-    public static class OtherHelper
+    public enum LogAction
+    {
+        TAO_PHIEU_MUON,
+        MO_TU_IOT,
+        TRA_PHONG,
+        DANG_NHAP,
+        KHOA_TAI_KHOAN
+    }
+
+    public static class Helper
     {
         public static string GetClientIp(HttpContext context)
         {

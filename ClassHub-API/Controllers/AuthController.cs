@@ -5,6 +5,7 @@ using ClassHub_API.Models;
 using ClassHub_API.Services;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using static ClassHub_API.Services.Helper;
 using BCryptNet = BCrypt.Net.BCrypt;
 
 namespace ClassHub_API.Controllers
@@ -30,16 +31,13 @@ namespace ClassHub_API.Controllers
                 return BadRequest(new { message = "Vui lòng nhập đầy đủ tài khoản và mật khẩu!" });
             }
 
-            // 1. Cho phép đăng nhập bằng Mã sinh viên HOẶC Email
-            var user = await _context.tai_khoan
-                .FirstOrDefaultAsync(u => u.ma_sv == model.MaSV.Trim() || u.email == model.MaSV.Trim());
+            var user = await _context.tai_khoan.FirstOrDefaultAsync(u => u.ma_sv == model.MaSV.Trim() || u.email == model.MaSV.Trim());
 
             if (user == null)
             {
                 return Unauthorized(new { message = "Tài khoản hoặc mật khẩu không chính xác!" });
             }
 
-            // 2. Kiểm tra trạng thái khóa tài khoản
             if (user.trang_thai == false)
             {
                 return StatusCode(StatusCodes.Status403Forbidden, new
@@ -48,7 +46,6 @@ namespace ClassHub_API.Controllers
                 });
             }
 
-            // 3. Xác thực mật khẩu (Hỗ trợ cả BCrypt và Plain-text cũ)
             bool isPasswordValid = false;
             bool isHashed = user.mat_khau.StartsWith("$2a$") ||
                             user.mat_khau.StartsWith("$2b$") ||
@@ -62,7 +59,6 @@ namespace ClassHub_API.Controllers
             {
                 isPasswordValid = (user.mat_khau == model.MatKhau);
 
-                // Lazy Migration: Tự động mã hóa BCrypt nếu đang là text thường
                 if (isPasswordValid)
                 {
                     user.mat_khau = BCryptNet.HashPassword(model.MatKhau, workFactor: 11);
@@ -80,11 +76,11 @@ namespace ClassHub_API.Controllers
                 var log = new NhatKyHeThong
                 {
                     ma_sv = user.ma_sv,
-                    hanh_dong = "DANG_NHAP",
+                    hanh_dong = LogAction.DANG_NHAP.ToString(),
                     chi_tiet = $"{user.vai_tro} Đăng nhập thành công ",
                     thoi_gian = DateTime.Now,
-                    ip_address = OtherHelper.GetClientIp(HttpContext),
-                    user_agent = OtherHelper.GetClientOs(Request),
+                    ip_address = Helper.GetClientIp(HttpContext),
+                    user_agent = Helper.GetClientOs(Request),
                 };
                 _context.nhat_ky_he_thong.Add(log);
                 await _context.SaveChangesAsync();
@@ -137,7 +133,7 @@ namespace ClassHub_API.Controllers
                 sdt = model.Sdt?.Trim(),
                 ten_lop = model.TenLop?.Trim(),
                 vai_tro = "SINHVIEN",
-                trang_thai = true, // Mặc định kích hoạt
+                trang_thai = true,
                 ngay_tao = DateTime.Now
             };
 

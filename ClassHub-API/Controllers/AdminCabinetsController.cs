@@ -13,7 +13,7 @@ namespace ClassHub_API.Controllers
 {
     [Route("api/admin/cabinets")]
     [ApiController]
-    [Authorize]
+    [Authorize(Roles = "ADMIN")]
     public class AdminCabinetsController : ControllerBase
     {
         private readonly AppDbContext _context;

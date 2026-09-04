@@ -10,7 +10,7 @@ namespace ClassHub_API.Controllers
 {
     [Route("api/admin/accounts")]
     [ApiController]
-    [Authorize]
+    [Authorize(Roles = "ADMIN")]
     public class AdminAccountController : Controller
     {
         private readonly AppDbContext _context;

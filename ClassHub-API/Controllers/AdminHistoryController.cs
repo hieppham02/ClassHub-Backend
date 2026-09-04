@@ -8,7 +8,7 @@ namespace ClassHub_API.Controllers
 {
     [Route("api/admin/history")]
     [ApiController]
-    [Authorize] // Bắt buộc quyền Admin
+    [Authorize(Roles = "ADMIN")]
     public class AdminHistoryController : ControllerBase
     {
         private readonly AppDbContext _context;
