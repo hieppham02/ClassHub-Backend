@@ -489,3 +489,4 @@ appsettings.Local.json
 *.local.json
 .env
 .env.*
+ClassHub-API/appsettings.Development.json
