@@ -7,6 +7,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Newtonsoft.Json;
 using System.Security.Claims;
+using System.Security.Cryptography;
 
 namespace ClassHub_API.Controllers
 {
@@ -15,129 +16,287 @@ namespace ClassHub_API.Controllers
     [Authorize]
     public class HistoryController : ControllerBase
     {
+        private static readonly string[] ActiveStatuses = { "PENDING", "ACTIVE", "IN_USE" };
+
         private readonly AppDbContext _context;
         private readonly IMqttService _mqttService;
+        private readonly ILogger<HistoryController> _logger;
 
-        public HistoryController(AppDbContext context, IMqttService mqttService)
+        public HistoryController(AppDbContext context, IMqttService mqttService, ILogger<HistoryController> logger)
         {
             _context = context;
             _mqttService = mqttService;
+            _logger = logger;
         }
 
         [HttpGet("get-history")]
         public async Task<IActionResult> GetHistory()
         {
-            var maSv = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
-            if (string.IsNullOrEmpty(maSv)) return Unauthorized();
+            string? currentUserId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
 
-            var rawData = await (from p in _context.phieu_muon
-                                 where p.ma_sv == maSv || p.ma_sv_uy_quyen == maSv
-                                 orderby p.thoi_gian_tao descending
-                                 join ph in _context.phong_hoc on p.ma_phong equals ph.ma_phong into phGroup
-                                 from ph in phGroup.DefaultIfEmpty()
-                                 join tn in _context.toa_nha on ph.ma_toa_nha equals tn.ma_toa_nha into tnGroup
-                                 from tn in tnGroup.DefaultIfEmpty()
-                                 join tkMuon in _context.tai_khoan on p.ma_sv equals tkMuon.ma_sv into tkMuonGroup
-                                 from tkMuon in tkMuonGroup.DefaultIfEmpty()
-                                 join tkTra in _context.tai_khoan on p.ma_sv_tra equals tkTra.ma_sv into tkTraGroup
-                                 from tkTra in tkTraGroup.DefaultIfEmpty()
-                                 select new
-                                 {
-                                     p.id,
-                                     p.ma_phong,
-                                     TenPhong = ph != null ? ph.ten_phong : p.ma_phong,
-                                     TenToaNha = tn != null ? tn.ten_toa_nha : "EAUT",
-                                     p.ngay_muon,
-                                     p.ca_muon,
-                                     p.trang_thai,
-                                     p.thoi_gian_tao,
-                                     p.thoi_gian_tra,
-                                     TenNguoiMuon = tkMuon != null ? tkMuon.ho_ten : p.ma_sv,
-                                     TenNguoiTra = tkTra != null ? tkTra.ho_ten : p.ma_sv_tra,
-                                     p.is_cabinet_open
-                                 }).ToListAsync();
-
-            var history = rawData.Select(p => new
+            if (string.IsNullOrWhiteSpace(currentUserId))
             {
-                id = p.id,
-                room = p.ma_phong,
-                name = p.TenPhong,
-                building = p.TenToaNha,
-                date = p.ngay_muon.ToString("dd-MM-yyyy"),
-                slot = "Ca " + p.ca_muon,
-                status = p.trang_thai,
-                borrowerName = p.TenNguoiMuon,
-                returnerName = p.TenNguoiTra,
-                createdAt = p.thoi_gian_tao.ToString("HH:mm"),
-                returnedAt = p.thoi_gian_tra.HasValue ? p.thoi_gian_tra.Value.ToString("HH:mm") : "---",
-                isCabinetOpen = p.is_cabinet_open == true
+                return Unauthorized(new { message = "Không xác định được người dùng." });
+            }
+
+            var rawData = await (
+                from borrowingSession in _context.phieu_muon.AsNoTracking()
+                where borrowingSession.ma_sv == currentUserId || borrowingSession.ma_sv_uy_quyen == currentUserId
+                orderby borrowingSession.thoi_gian_tao descending
+
+                join room in _context.phong_hoc on borrowingSession.ma_phong equals room.ma_phong into roomGroup
+                from room in roomGroup.DefaultIfEmpty()
+
+                join building in _context.toa_nha on room.ma_toa_nha equals building.ma_toa_nha into buildingGroup
+                from building in buildingGroup.DefaultIfEmpty()
+
+                join borrower in _context.tai_khoan on borrowingSession.ma_sv equals borrower.ma_sv into borrowerGroup
+                from borrower in borrowerGroup.DefaultIfEmpty()
+
+                join returner in _context.tai_khoan on borrowingSession.ma_sv_tra equals returner.ma_sv into returnerGroup
+                from returner in returnerGroup.DefaultIfEmpty()
+
+                select new
+                {
+                    borrowingSession.id,
+                    borrowingSession.ma_phong,
+                    RoomName = room != null ? room.ten_phong : borrowingSession.ma_phong,
+                    BuildingName = building != null ? building.ten_toa_nha : "Chưa xác định",
+                    borrowingSession.ngay_muon,
+                    borrowingSession.ca_muon,
+                    borrowingSession.trang_thai,
+                    borrowingSession.thoi_gian_tao,
+                    borrowingSession.thoi_gian_tra,
+                    BorrowerName = borrower != null ? borrower.ho_ten : borrowingSession.ma_sv,
+                    ReturnerName = returner != null ? returner.ho_ten : borrowingSession.ma_sv_tra,
+                    borrowingSession.is_cabinet_open
+                }).ToListAsync();
+
+            var history = rawData.Select(item => new
+            {
+                id = item.id,
+                room = item.ma_phong,
+                name = item.RoomName,
+                building = item.BuildingName,
+                date = item.ngay_muon.ToString("dd-MM-yyyy"),
+                slot = $"Ca {item.ca_muon}",
+                status = item.trang_thai,
+                borrowerName = item.BorrowerName,
+                returnerName = item.ReturnerName,
+                createdAt = item.thoi_gian_tao.ToString("HH:mm"),
+                returnedAt = item.thoi_gian_tra?.ToString("HH:mm") ?? "---",
+                isCabinetOpen = item.is_cabinet_open == true
             }).ToList();
 
             return Ok(history);
         }
 
-        [HttpPost("refresh-otp/{id}")]
+        [HttpPost("refresh-otp/{id:int}")]
         public async Task<IActionResult> RefreshOtp(int id)
         {
-            var maSv = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
-            if (string.IsNullOrEmpty(maSv)) return Unauthorized();
+            string? currentUserId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
 
-            var phieu = await _context.phieu_muon.FirstOrDefaultAsync(p => p.id == id && (p.ma_sv == maSv || p.ma_sv_uy_quyen == maSv));
-            if (phieu == null) return NotFound(new { message = "Không tìm thấy phiếu mượn hoặc bạn không có quyền!" });
+            if (string.IsNullOrWhiteSpace(currentUserId))
+            {
+                return Unauthorized(new { message = "Không xác định được người dùng." });
+            }
 
-            if (phieu.trang_thai == "COMPLETED" || phieu.trang_thai == "CANCELED")
-                return BadRequest(new { message = "Phòng đã trả hoặc hủy, không thể cấp lại OTP!" });
+            var borrowingSession = await _context.phieu_muon.FirstOrDefaultAsync(session =>
+                session.id == id &&
+                (session.ma_sv == currentUserId || session.ma_sv_uy_quyen == currentUserId));
 
-            Random rnd = new Random();
-            string newOtp = rnd.Next(100000, 999999).ToString();
+            if (borrowingSession == null)
+            {
+                return NotFound(new { message = "Không tìm thấy phiếu mượn hoặc bạn không có quyền cấp lại OTP." });
+            }
 
-            phieu.otp = newOtp;
-            phieu.otp_expires_at = DateTime.Now.AddMinutes(30);
+            if (!ActiveStatuses.Contains(borrowingSession.trang_thai))
+            {
+                return Conflict(new { message = "Phiếu mượn không còn ở trạng thái cấp OTP." });
+            }
+
+            var cabinet = await _context.thiet_bi_iot.FirstOrDefaultAsync(item => item.ma_phong == borrowingSession.ma_phong);
+
+            if (cabinet == null)
+            {
+                return NotFound(new { message = "Phòng này chưa được gán tủ." });
+            }
+
+            if (!cabinet.trang_thai_mang)
+            {
+                return StatusCode(StatusCodes.Status503ServiceUnavailable, new
+                {
+                    message = "Tủ đang ngoại tuyến nên chưa thể cấp OTP."
+                });
+            }
+
+            if (cabinet.trang_thai_khoa == "ERROR")
+            {
+                return Conflict(new { message = "Tủ đang gặp lỗi hoặc được bảo trì." });
+            }
+
+            string newOtp = RandomNumberGenerator.GetInt32(100000, 1000000).ToString();
+            DateTime expiresAt = DateTime.Now.AddMinutes(3);
+
+            borrowingSession.otp = newOtp;
+            borrowingSession.otp_expires_at = expiresAt;
+
+            _context.nhat_ky_he_thong.Add(new NhatKyHeThong
+            {
+                ma_sv = currentUserId,
+                hanh_dong = "CAP_LAI_OTP",
+                chi_tiet = $"Cấp lại OTP cho phiếu #{borrowingSession.id}, phòng {borrowingSession.ma_phong}",
+                thoi_gian = DateTime.Now,
+                ip_address = Helper.GetClientIp(HttpContext),
+                user_agent = Helper.GetClientOs(Request)
+            });
+
             await _context.SaveChangesAsync();
 
-            // GỬI OTP MỚI: backend/cabinet/{ma_phong}/otp
-            string topic = $"backend/cabinet/{phieu.ma_phong}/otp";
-            var obj = new { id = phieu.id, room = phieu.ma_phong, otp = newOtp };
-            string payload = JsonConvert.SerializeObject(obj);
+            string topic = $"backend/cabinet/{borrowingSession.ma_phong}/otp";
 
-            await _mqttService.PublishAsync(topic, payload);
-            await _mqttService.PublishAsync("tu_thiet_bi/OTP", payload);
+            var otpPayload = new
+            {
+                id = borrowingSession.id.ToString(),
+                room = borrowingSession.ma_phong,
+                otp = newOtp
+            };
 
-            return Ok(new { message = "Đã cấp lại mã OTP mới cho thiết bị!" });
+            string payload = JsonConvert.SerializeObject(otpPayload);
+
+            try
+            {
+                await _mqttService.PublishAsync(topic, payload);
+            }
+            catch (Exception exception)
+            {
+                _logger.LogError(exception, "Không thể gửi OTP tới tủ phòng {RoomId}", borrowingSession.ma_phong);
+
+                return StatusCode(StatusCodes.Status503ServiceUnavailable, new
+                {
+                    message = "OTP đã được tạo nhưng chưa gửi được tới tủ. Vui lòng thử cấp lại."
+                });
+            }
+
+            return Ok(new
+            {
+                message = "Đã cấp mã OTP mới.",
+                expiresAt
+            });
         }
 
-        [HttpPost("delegate/{id}")]
-        public async Task<IActionResult> DelegateAccess(int id, [FromBody] DelegateDTO req)
+        [HttpPost("delegate/{id:int}")]
+        public async Task<IActionResult> DelegateAccess(int id, [FromBody] DelegateDTO request)
         {
-            var maSv = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
-            if (string.IsNullOrEmpty(maSv)) return Unauthorized();
+            string? currentUserId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
 
-            var phieu = await _context.phieu_muon.FirstOrDefaultAsync(p => p.id == id && p.ma_sv == maSv);
-            if (phieu == null) return NotFound(new { message = "Không tìm thấy phiếu hoặc bạn không phải người mượn gốc!" });
+            if (string.IsNullOrWhiteSpace(currentUserId))
+            {
+                return Unauthorized(new { message = "Không xác định được người dùng." });
+            }
 
-            var userDelegate = await _context.tai_khoan.FirstOrDefaultAsync(t => t.ma_sv == req.DelegateId);
-            if (userDelegate == null) return BadRequest(new { message = "Mã sinh viên này không tồn tại trong hệ thống!" });
+            if (request == null || string.IsNullOrWhiteSpace(request.DelegateId))
+            {
+                return BadRequest(new { message = "Vui lòng nhập mã người được ủy quyền." });
+            }
 
-            if (userDelegate.ma_sv == maSv) return BadRequest(new { message = "Không thể tự ủy quyền cho chính mình!" });
+            string delegateId = request.DelegateId.Trim();
 
-            phieu.ma_sv_uy_quyen = req.DelegateId;
+            var borrowingSession = await _context.phieu_muon.FirstOrDefaultAsync(session =>
+                session.id == id && session.ma_sv == currentUserId);
+
+            if (borrowingSession == null)
+            {
+                return NotFound(new { message = "Không tìm thấy phiếu hoặc bạn không phải người mượn gốc." });
+            }
+
+            if (!ActiveStatuses.Contains(borrowingSession.trang_thai))
+            {
+                return Conflict(new { message = "Phiếu mượn không còn ở trạng thái được phép ủy quyền." });
+            }
+
+            if (delegateId == currentUserId)
+            {
+                return BadRequest(new { message = "Không thể tự ủy quyền cho chính mình." });
+            }
+
+            var delegatedUser = await _context.tai_khoan.AsNoTracking()
+                .FirstOrDefaultAsync(user => user.ma_sv == delegateId);
+
+            if (delegatedUser == null)
+            {
+                return NotFound(new { message = "Người được ủy quyền không tồn tại." });
+            }
+
+            if (!delegatedUser.trang_thai)
+            {
+                return Conflict(new { message = "Tài khoản được ủy quyền đang bị khóa." });
+            }
+
+            borrowingSession.ma_sv_uy_quyen = delegatedUser.ma_sv;
+
+            _context.nhat_ky_he_thong.Add(new NhatKyHeThong
+            {
+                ma_sv = currentUserId,
+                hanh_dong = "UY_QUYEN",
+                chi_tiet = $"Ủy quyền phiếu #{borrowingSession.id} cho {delegatedUser.ma_sv}",
+                thoi_gian = DateTime.Now,
+                ip_address = Helper.GetClientIp(HttpContext),
+                user_agent = Helper.GetClientOs(Request)
+            });
+
             await _context.SaveChangesAsync();
 
-            return Ok(new { message = $"Đã ủy quyền thành công cho: {userDelegate.ho_ten}!" });
+            return Ok(new
+            {
+                message = $"Đã ủy quyền thành công cho {delegatedUser.ho_ten}."
+            });
         }
 
-        [HttpPost("revoke/{id}")]
+        [HttpPost("revoke/{id:int}")]
         public async Task<IActionResult> RevokeAccess(int id)
         {
-            var maSv = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
-            if (string.IsNullOrEmpty(maSv)) return Unauthorized();
+            string? currentUserId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
 
-            var phieu = await _context.phieu_muon.FirstOrDefaultAsync(p => p.id == id && p.ma_sv == maSv);
-            if (phieu == null) return NotFound(new { message = "Không tìm thấy phiếu hoặc bạn không có quyền!" });
+            if (string.IsNullOrWhiteSpace(currentUserId))
+            {
+                return Unauthorized(new { message = "Không xác định được người dùng." });
+            }
 
-            phieu.ma_sv_uy_quyen = null;
+            var borrowingSession = await _context.phieu_muon.FirstOrDefaultAsync(session =>
+                session.id == id && session.ma_sv == currentUserId);
+
+            if (borrowingSession == null)
+            {
+                return NotFound(new { message = "Không tìm thấy phiếu hoặc bạn không phải người mượn gốc." });
+            }
+
+            if (!ActiveStatuses.Contains(borrowingSession.trang_thai))
+            {
+                return Conflict(new { message = "Phiếu mượn không còn ở trạng thái được phép thu hồi quyền." });
+            }
+
+            if (string.IsNullOrWhiteSpace(borrowingSession.ma_sv_uy_quyen))
+            {
+                return Conflict(new { message = "Phiếu mượn hiện không có người được ủy quyền." });
+            }
+
+            string revokedUserId = borrowingSession.ma_sv_uy_quyen;
+            borrowingSession.ma_sv_uy_quyen = null;
+
+            _context.nhat_ky_he_thong.Add(new NhatKyHeThong
+            {
+                ma_sv = currentUserId,
+                hanh_dong = "THU_HOI_UY_QUYEN",
+                chi_tiet = $"Thu hồi quyền của {revokedUserId} trên phiếu #{borrowingSession.id}",
+                thoi_gian = DateTime.Now,
+                ip_address = Helper.GetClientIp(HttpContext),
+                user_agent = Helper.GetClientOs(Request)
+            });
+
             await _context.SaveChangesAsync();
-            return Ok(new { message = "Đã thu hồi quyền thành công!" });
+
+            return Ok(new { message = "Đã thu hồi quyền thành công." });
         }
     }
 }

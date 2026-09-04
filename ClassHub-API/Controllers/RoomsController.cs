@@ -20,32 +20,57 @@ namespace ClassHub_API.Controllers
         [HttpGet("get-rooms")]
         public async Task<IActionResult> GetDanhSachPhong()
         {
-            var danhSach = await (from p in _context.phong_hoc
-                                  join iot in _context.thiet_bi_iot on p.ma_phong equals iot.ma_phong into iotGroup
-                                  from iot in iotGroup.DefaultIfEmpty()
-                                  select new
-                                  {
-                                      id = p.ma_phong,
-                                      building = _context.toa_nha
-                                          .Where(t => t.ma_toa_nha == p.ma_toa_nha)
-                                          .Select(t => t.ten_toa_nha)
-                                          .FirstOrDefault() ?? p.ma_toa_nha,
-                                      floor = p.ten_phong.Contains("-")
-                                          ? "Tầng " + p.ten_phong.Substring(p.ten_phong.IndexOf("-") + 1, 1)
-                                          : "Tầng 1",
-                                      name = p.ten_phong,
-                                      capacity = p.suc_chua ?? 0,
-                                      // Nếu phòng bị khóa/bảo trì HOẶC thiết bị IoT đang Offline -> Trạng thái MAINTENANCE (Bảo trì)
-                                      status = (p.trang_thai == "BAO_TRI" || (iot != null && !iot.trang_thai_mang)) ? "MAINTENANCE" : "AVAILABLE",
-                                      isOnline = iot != null && iot.trang_thai_mang,
-                                      equipment = _context.thiet_bi
-                                          .Where(tb => tb.ma_phong == p.ma_phong)
-                                          .Select(tb => tb.ten_thiet_bi)
-                                          .ToList(),
-                                      tone = "from-blue-600 to-cyan-500"
-                                  }).ToListAsync();
+            var rooms = await _context.phong_hoc
+                .AsNoTracking()
+                .AsSplitQuery()
+                .Include(room => room.MaToaNhaNavigation)
+                .Include(room => room.ThietBis)
+                .Include(room => room.ThietBiIots)
+                .OrderBy(room => room.ma_toa_nha)
+                .ThenBy(room => room.tang)
+                .ThenBy(room => room.ma_phong)
+                .ToListAsync();
 
-            return Ok(danhSach);
+            var result = rooms.Select(room =>
+            {
+                var cabinet = room.ThietBiIots
+                    .OrderByDescending(item => item.trang_thai_mang)
+                    .ThenBy(item => item.id)
+                    .FirstOrDefault();
+
+                bool hasCabinet = cabinet != null;
+                bool isOnline = cabinet?.trang_thai_mang ?? false;
+                bool hasCabinetError = cabinet?.trang_thai_khoa == "ERROR";
+
+                bool isAvailable = room.trang_thai == "HOAT_DONG"
+                    && hasCabinet
+                    && isOnline
+                    && !hasCabinetError;
+
+                return new
+                {
+                    id = room.ma_phong,
+                    building = room.MaToaNhaNavigation?.ten_toa_nha ?? room.ma_toa_nha ?? "---",
+                    buildingId = room.ma_toa_nha,
+                    floor = $"Tầng {room.tang}",
+                    floorNum = room.tang,
+                    name = room.ten_phong,
+                    capacity = room.suc_chua ?? 0,
+                    status = isAvailable ? "AVAILABLE" : "MAINTENANCE",
+                    roomStatus = room.trang_thai,
+                    hasCabinet,
+                    isOnline,
+                    lockStatus = cabinet?.trang_thai_khoa,
+                    equipment = room.ThietBis
+                        .Select(equipment => equipment.ten_thiet_bi)
+                        .Distinct()
+                        .OrderBy(name => name)
+                        .ToList(),
+                    tone = "from-blue-600 to-cyan-500"
+                };
+            });
+
+            return Ok(result);
         }
     }
 }

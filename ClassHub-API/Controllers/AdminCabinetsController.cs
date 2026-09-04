@@ -16,243 +16,316 @@ namespace ClassHub_API.Controllers
     [Authorize(Roles = "ADMIN")]
     public class AdminCabinetsController : ControllerBase
     {
+        private static readonly string[] ActiveStatuses = { "PENDING", "ACTIVE", "IN_USE", "RETURNING" };
+
         private readonly AppDbContext _context;
         private readonly IMqttService _mqttService;
         private readonly IHubContext<CabinetHub> _hubContext;
+        private readonly ILogger<AdminCabinetsController> _logger;
 
         public AdminCabinetsController(
             AppDbContext context,
             IMqttService mqttService,
-            IHubContext<CabinetHub> hubContext)
+            IHubContext<CabinetHub> hubContext,
+            ILogger<AdminCabinetsController> logger)
         {
             _context = context;
             _mqttService = mqttService;
             _hubContext = hubContext;
+            _logger = logger;
         }
 
         [HttpGet]
         public async Task<IActionResult> GetAllCabinets()
         {
             var cabinets = await _context.thiet_bi_iot
+                .AsNoTracking()
                 .Include(c => c.MaPhongNavigation)
                 .ThenInclude(p => p.MaToaNhaNavigation)
+                .OrderBy(c => c.ma_phong)
                 .ToListAsync();
-
-            var today = DateTime.Today;
-            var tomorrow = today.AddDays(1);
 
             var activeBookings = await _context.phieu_muon
-                .Where(p => (p.trang_thai == "ACTIVE" || p.trang_thai == "PENDING" || p.trang_thai == "IN_USE")
-                         && p.ngay_muon >= today && p.ngay_muon < tomorrow)
+                .AsNoTracking()
                 .Include(p => p.MaSvNavigation)
+                .Where(p => ActiveStatuses.Contains(p.trang_thai))
+                .OrderByDescending(p => p.thoi_gian_tao)
                 .ToListAsync();
 
-            var result = cabinets.Select(cab =>
+            var currentBookings = activeBookings
+                .GroupBy(p => p.ma_phong)
+                .ToDictionary(group => group.Key, group => group.First());
+
+            var result = cabinets.Select(cabinet =>
             {
-                var room = cab.MaPhongNavigation;
+                string roomId = cabinet.ma_phong ?? "---";
+                var room = cabinet.MaPhongNavigation;
                 var building = room?.MaToaNhaNavigation;
-                var currentBooking = activeBookings.FirstOrDefault(b => b.ma_phong == cab.ma_phong);
 
-                string status = "Trống";
-                if (room?.trang_thai == "BAO_TRI" || room?.trang_thai == "TAM_KHOA" || cab.trang_thai_khoa == "ERROR")
-                {
-                    status = "Bảo trì";
-                }
-                else if (currentBooking != null)
-                {
-                    status = "Đang mượn";
-                }
+                currentBookings.TryGetValue(roomId, out PhieuMuon? currentBooking);
 
-                bool isOpen = (cab.trang_thai_khoa == "UNLOCKED") || (currentBooking != null && currentBooking.is_cabinet_open == true);
-                string doorCondition = isOpen ? "Mở" : "Đóng";
+                bool isUnlocked = cabinet.trang_thai_khoa == "UNLOCKED";
+                string status = GetCabinetDisplayStatus(cabinet, room?.trang_thai, currentBooking);
 
                 return new
                 {
-                    id = cab.id,
-                    roomId = cab.ma_phong,
-                    name = cab.ten_tu,
-                    roomName = room?.ten_phong ?? cab.ma_phong,
-                    building = building?.ten_toa_nha ?? (cab.ma_phong.Substring(0, Math.Min(3, cab.ma_phong.Length))),
+                    id = cabinet.id,
+                    roomId,
+                    name = cabinet.ten_tu,
+                    roomName = room?.ten_phong ?? roomId,
+                    building = building?.ten_toa_nha ?? GetBuildingCode(roomId),
                     floor = $"Tầng {room?.tang ?? 1}",
-                    macAddress = cab.mac_address,
-                    mqttTopic = cab.mqtt_topic,
-                    isOnline = cab.trang_thai_mang,
-                    status = status,
-                    doorCondition = doorCondition,
-                    isDoorOpen = isOpen,
-                    borrower = currentBooking?.MaSvNavigation?.ho_ten != null
+                    macAddress = cabinet.mac_address,
+                    mqttTopic = cabinet.mqtt_topic,
+                    isOnline = cabinet.trang_thai_mang,
+                    status,
+                    doorCondition = isUnlocked ? "Mở" : "Đóng",
+                    isDoorOpen = isUnlocked,
+                    lockStatus = cabinet.trang_thai_khoa,
+                    borrower = currentBooking?.MaSvNavigation != null
                         ? $"{currentBooking.MaSvNavigation.ho_ten} ({currentBooking.ma_sv})"
                         : "---",
-                    lastOnline = cab.lan_cuoi_online?.ToString("dd/MM/yyyy HH:mm") ?? "Chưa online"
+                    borrowingStatus = currentBooking?.trang_thai,
+                    lastOnline = cabinet.lan_cuoi_online?.ToString("dd/MM/yyyy HH:mm:ss") ?? "Chưa online"
                 };
-            }).ToList();
+            });
 
             return Ok(result);
         }
 
-        [HttpPost("remote-open/{id}")]
+        [HttpPost("remote-open/{id:int}")]
         public async Task<IActionResult> RemoteOpenDoor(int id)
         {
-            var adminId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value ?? "ADMIN";
-            var cab = await _context.thiet_bi_iot.FindAsync(id);
-            if (cab == null) return NotFound(new { message = "Không tìm thấy tủ đồ IoT này!" });
+            string? adminId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+            if (string.IsNullOrWhiteSpace(adminId))
+                return Unauthorized(new { message = "Không xác định được quản trị viên." });
 
-            cab.trang_thai_khoa = "UNLOCKED";
-            cab.lan_cuoi_online = DateTime.Now;
+            var cabinet = await _context.thiet_bi_iot
+                .AsNoTracking()
+                .FirstOrDefaultAsync(c => c.id == id);
 
-            var activePhieu = await _context.phieu_muon
-                .Where(p => p.ma_phong == cab.ma_phong && (p.trang_thai == "ACTIVE" || p.trang_thai == "PENDING" || p.trang_thai == "IN_USE"))
-                .ToListAsync();
+            if (cabinet == null) return NotFound(new { message = "Không tìm thấy tủ IoT." });
+            if (string.IsNullOrWhiteSpace(cabinet.ma_phong))
+                return BadRequest(new { message = "Tủ chưa được gán vào phòng học." });
 
-            foreach (var p in activePhieu)
+            if (!cabinet.trang_thai_mang)
+                return BadRequest(new { message = "Tủ đang offline. Không thể gửi lệnh mở." });
+
+            if (cabinet.trang_thai_khoa == "ERROR")
+                return BadRequest(new { message = "Tủ đang gặp lỗi hoặc bảo trì." });
+
+            var activeBooking = await _context.phieu_muon
+                .AsNoTracking()
+                .Where(p => p.ma_phong == cabinet.ma_phong && ActiveStatuses.Contains(p.trang_thai))
+                .OrderByDescending(p => p.thoi_gian_tao)
+                .FirstOrDefaultAsync();
+
+            AddAuditLog(
+                adminId,
+                "ADMIN_YEU_CAU_MO_TU",
+                $"Quản trị viên yêu cầu mở tủ {cabinet.ten_tu}, phòng {cabinet.ma_phong}.");
+
+            try
             {
-                p.is_cabinet_open = true;
-                if (p.trang_thai == "PENDING")
-                {
-                    p.trang_thai = "ACTIVE";
-                    p.thoi_gian_nhan = DateTime.Now;
-                }
+                await _context.SaveChangesAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Không thể ghi audit log khi admin mở tủ {CabinetId}.", cabinet.id);
+                return StatusCode(StatusCodes.Status500InternalServerError, new { message = "Không thể ghi nhận yêu cầu mở tủ." });
             }
 
-            await _context.SaveChangesAsync();
-
-            // GÓI TIN ĐẦY ĐỦ ROOM VÀ UNIX TIMESTAMP (Chỉ ~58 bytes)
-            string topic = $"backend/cabinet/{cab.ma_phong}/action";
-            var obj = new
+            string topic = $"backend/cabinet/{cabinet.ma_phong}/action";
+            string payload = JsonConvert.SerializeObject(new
             {
-                room = cab.ma_phong,
+                id = activeBooking?.id.ToString() ?? "0",
+                room = cabinet.ma_phong,
                 action = "open",
-                id = activePhieu.FirstOrDefault()?.id.ToString() ?? "0",
-                ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds() // Unix timestamp gọn nhẹ
-            };
-            string payload = JsonConvert.SerializeObject(obj);
-
-            await _mqttService.PublishAsync(topic, payload);
-
-            var ipAddress = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "Localhost";
-            var userAgent = Request.Headers["User-Agent"].ToString();
-            _context.nhat_ky_he_thong.Add(new NhatKyHeThong
-            {
-                ma_sv = adminId,
-                hanh_dong = "ADMIN_MO_TU",
-                chi_tiet = $"Admin mở khóa tủ {cab.ten_tu} (Phòng {cab.ma_phong})",
-                thoi_gian = DateTime.Now,
-                ip_address = ipAddress,
-                user_agent = ParseOSFromUserAgent(userAgent)
-            });
-            await _context.SaveChangesAsync();
-
-            await _hubContext.Clients.All.SendAsync("CabinetStatusChanged", new
-            {
-                roomId = cab.ma_phong,
-                isOpen = true,
-                doorCondition = "Mở",
-                isOnline = cab.trang_thai_mang,
-                lockStatus = "UNLOCKED",
-                timestamp = DateTime.Now.ToString("HH:mm:ss"),
-                
+                ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
             });
 
-            return Ok(new { message = $"Đã gửi lệnh mở tủ {cab.ten_tu} thành công!" });
+            try
+            {
+                await _mqttService.PublishAsync(topic, payload);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Không gửi được lệnh mở tới tủ {CabinetId}.", cabinet.id);
+
+                return StatusCode(StatusCodes.Status503ServiceUnavailable, new
+                {
+                    message = "Không gửi được lệnh mở tới tủ. Hãy thử lại."
+                });
+            }
+
+            return Accepted(new
+            {
+                message = $"Đã gửi lệnh mở tủ {cabinet.ten_tu}. Đang chờ ESP32 xác nhận."
+            });
         }
 
-        [HttpPost("remote-lock/{id}")]
+        [HttpPost("remote-lock/{id:int}")]
         public async Task<IActionResult> RemoteLockDoor(int id)
         {
-            var adminId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value ?? "ADMIN";
-            var cab = await _context.thiet_bi_iot.FindAsync(id);
-            if (cab == null) return NotFound(new { message = "Không tìm thấy tủ đồ IoT này!" });
+            string? adminId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+            if (string.IsNullOrWhiteSpace(adminId))
+                return Unauthorized(new { message = "Không xác định được quản trị viên." });
 
-            cab.trang_thai_khoa = "LOCKED";
-            cab.lan_cuoi_online = DateTime.Now;
+            var cabinet = await _context.thiet_bi_iot
+                .AsNoTracking()
+                .FirstOrDefaultAsync(c => c.id == id);
 
-            var activePhieu = await _context.phieu_muon
-                .Where(p => p.ma_phong == cab.ma_phong && (p.trang_thai == "ACTIVE" || p.trang_thai == "PENDING" || p.trang_thai == "IN_USE"))
-                .ToListAsync();
+            if (cabinet == null) return NotFound(new { message = "Không tìm thấy tủ IoT." });
+            if (string.IsNullOrWhiteSpace(cabinet.ma_phong))
+                return BadRequest(new { message = "Tủ chưa được gán vào phòng học." });
 
-            foreach (var p in activePhieu)
+            if (!cabinet.trang_thai_mang)
+                return BadRequest(new { message = "Tủ đang offline. Không thể gửi lệnh khóa." });
+
+            if (cabinet.trang_thai_khoa == "ERROR")
+                return BadRequest(new { message = "Tủ đang gặp lỗi hoặc bảo trì." });
+
+            var activeBooking = await _context.phieu_muon
+                .AsNoTracking()
+                .Where(p => p.ma_phong == cabinet.ma_phong && ActiveStatuses.Contains(p.trang_thai))
+                .OrderByDescending(p => p.thoi_gian_tao)
+                .FirstOrDefaultAsync();
+
+            AddAuditLog(
+                adminId,
+                "ADMIN_YEU_CAU_KHOA_TU",
+                $"Quản trị viên yêu cầu khóa tủ {cabinet.ten_tu}, phòng {cabinet.ma_phong}.");
+
+            try
             {
-                p.is_cabinet_open = false;
+                await _context.SaveChangesAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Không thể ghi audit log khi admin khóa tủ {CabinetId}.", cabinet.id);
+                return StatusCode(StatusCodes.Status500InternalServerError, new { message = "Không thể ghi nhận yêu cầu khóa tủ." });
             }
 
-            await _context.SaveChangesAsync();
-
-            // GÓI TIN NHỎ GỌN TỐI ƯU
-            string topic = $"backend/cabinet/{cab.ma_phong}/action";
-            var obj = new
+            string topic = $"backend/cabinet/{cabinet.ma_phong}/action";
+            string payload = JsonConvert.SerializeObject(new
             {
+                id = activeBooking?.id.ToString() ?? "0",
+                room = cabinet.ma_phong,
                 action = "lock",
-                id = activePhieu.FirstOrDefault()?.id.ToString() ?? "0"
-            };
-            string payload = JsonConvert.SerializeObject(obj);
-
-            await _mqttService.PublishAsync(topic, payload);
-
-            await _hubContext.Clients.All.SendAsync("CabinetStatusChanged", new
-            {
-                roomId = cab.ma_phong,
-                isOpen = false,
-                doorCondition = "Đóng",
-                isOnline = cab.trang_thai_mang,
-                lockStatus = "LOCKED",
-                timestamp = DateTime.Now.ToString("HH:mm:ss")
+                ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
             });
 
-            return Ok(new { message = $"Đã khóa an toàn tủ {cab.ten_tu}!" });
+            try
+            {
+                await _mqttService.PublishAsync(topic, payload);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Không gửi được lệnh khóa tới tủ {CabinetId}.", cabinet.id);
+
+                return StatusCode(StatusCodes.Status503ServiceUnavailable, new
+                {
+                    message = "Không gửi được lệnh khóa tới tủ. Hãy thử lại."
+                });
+            }
+
+            return Accepted(new
+            {
+                message = $"Đã gửi lệnh khóa tủ {cabinet.ten_tu}. Đang chờ ESP32 xác nhận."
+            });
         }
 
-        [HttpPatch("{id}/toggle-maintenance")]
+        [HttpPatch("{id:int}/toggle-maintenance")]
         public async Task<IActionResult> ToggleMaintenance(int id)
         {
-            var cab = await _context.thiet_bi_iot
+            string? adminId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+            if (string.IsNullOrWhiteSpace(adminId))
+                return Unauthorized(new { message = "Không xác định được quản trị viên." });
+
+            var cabinet = await _context.thiet_bi_iot
                 .Include(c => c.MaPhongNavigation)
                 .FirstOrDefaultAsync(c => c.id == id);
 
-            if (cab == null) return NotFound(new { message = "Không tìm thấy tủ đồ!" });
+            if (cabinet == null) return NotFound(new { message = "Không tìm thấy tủ IoT." });
 
-            var room = cab.MaPhongNavigation;
-            if (room != null)
+            var room = cabinet.MaPhongNavigation;
+            if (room == null) return BadRequest(new { message = "Không tìm thấy phòng học của tủ." });
+
+            bool enableMaintenance = room.trang_thai != "BAO_TRI";
+            room.trang_thai = enableMaintenance ? "BAO_TRI" : "HOAT_DONG";
+
+            AddAuditLog(
+                adminId,
+                enableMaintenance ? "BAT_BAO_TRI_TU" : "TAT_BAO_TRI_TU",
+                $"{(enableMaintenance ? "Bật" : "Tắt")} chế độ bảo trì tủ {cabinet.ten_tu}, phòng {cabinet.ma_phong}.");
+
+            try
             {
-                room.trang_thai = (room.trang_thai == "BAO_TRI") ? "HOAT_DONG" : "BAO_TRI";
                 await _context.SaveChangesAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Không thể đổi trạng thái bảo trì của tủ {CabinetId}.", cabinet.id);
 
-                string newStatus = (room.trang_thai == "BAO_TRI") ? "Bảo trì" : "Trống";
-
-                await _hubContext.Clients.All.SendAsync("CabinetStatusChanged", new
-                {
-                    roomId = cab.ma_phong,
-                    status = newStatus,
-                    isOnline = cab.trang_thai_mang,
-                    isOpen = cab.trang_thai_khoa == "UNLOCKED",
-                    doorCondition = (cab.trang_thai_khoa == "UNLOCKED") ? "Mở" : "Đóng",
-                    timestamp = DateTime.Now.ToString("HH:mm:ss")
-                });
-
-                return Ok(new
-                {
-                    message = (room.trang_thai == "BAO_TRI") ? "Đã chuyển tủ sang chế độ Bảo trì!" : "Đã chuyển tủ sang Hoạt động bình thường!",
-                    status = newStatus
-                });
+                return StatusCode(
+                    StatusCodes.Status500InternalServerError,
+                    new { message = "Không thể đổi trạng thái bảo trì." });
             }
 
-            return BadRequest(new { message = "Không tìm thấy thông tin phòng học!" });
+            string displayStatus = enableMaintenance ? "Bảo trì" : "Trống";
+
+            try
+            {
+                await _hubContext.Clients.All.SendAsync("CabinetStatusChanged", new
+                {
+                    roomId = cabinet.ma_phong,
+                    status = displayStatus,
+                    isOnline = cabinet.trang_thai_mang,
+                    isOpen = cabinet.trang_thai_khoa == "UNLOCKED",
+                    doorCondition = cabinet.trang_thai_khoa == "UNLOCKED" ? "Mở" : "Đóng",
+                    lockStatus = cabinet.trang_thai_khoa,
+                    timestamp = DateTime.Now.ToString("HH:mm:ss")
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Không gửi được SignalR khi đổi bảo trì tủ {CabinetId}.", cabinet.id);
+            }
+
+            string message = enableMaintenance
+                ? "Đã chuyển tủ sang chế độ bảo trì."
+                : "Đã chuyển tủ sang hoạt động bình thường.";
+
+            return Ok(new { message, status = displayStatus });
         }
 
-        public static string ParseOSFromUserAgent(string userAgent)
+        private void AddAuditLog(string adminId, string action, string detail)
         {
-            if (string.IsNullOrWhiteSpace(userAgent))
-                return "Unknown";
+            _context.nhat_ky_he_thong.Add(new NhatKyHeThong
+            {
+                ma_sv = adminId,
+                hanh_dong = action,
+                chi_tiet = detail,
+                thoi_gian = DateTime.Now,
+                ip_address = Helper.GetClientIp(HttpContext),
+                user_agent = Helper.GetClientOs(Request)
+            });
+        }
 
-            if (userAgent.Contains("Windows NT 10.0")) return "Windows 10/11";
-            if (userAgent.Contains("Windows NT 6.3")) return "Windows 8.1";
-            if (userAgent.Contains("Windows NT 6.2")) return "Windows 8";
-            if (userAgent.Contains("Windows NT 6.1")) return "Windows 7";
-            if (userAgent.Contains("Mac OS X")) return "macOS";
-            if (userAgent.Contains("Android")) return "Android";
-            if (userAgent.Contains("iPhone") || userAgent.Contains("iPad")) return "iOS";
-            if (userAgent.Contains("Linux")) return "Linux";
+        private static string GetCabinetDisplayStatus(ThietBiIot cabinet, string? roomStatus, PhieuMuon? booking)
+        {
+            if (roomStatus is "BAO_TRI" or "TAM_KHOA" || cabinet.trang_thai_khoa == "ERROR") return "Bảo trì";
+            if (!cabinet.trang_thai_mang) return "Mất kết nối";
+            if (booking?.trang_thai == "RETURNING") return "Đang xác nhận trả";
+            if (booking != null) return "Đang mượn";
 
-            return "Other";
+            return "Trống";
+        }
+
+        private static string GetBuildingCode(string roomId)
+        {
+            if (string.IsNullOrWhiteSpace(roomId) || roomId == "---") return "---";
+            return roomId[..Math.Min(3, roomId.Length)];
         }
     }
 }

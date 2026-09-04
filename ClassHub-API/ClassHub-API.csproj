@@ -6,6 +6,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>ClassHub_API</RootNamespace>
     <DockerDefaultTargetOS>Windows</DockerDefaultTargetOS>
+    <UserSecretsId>8440d348-7540-4d65-b3c0-00df83ab0560</UserSecretsId>
   </PropertyGroup>
 
   <ItemGroup>

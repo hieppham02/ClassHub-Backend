@@ -1,13 +1,15 @@
 ﻿using ClassHub_API.Data;
 using ClassHub_API.DTOs;
-using ClassHub_API.Hubs;
+using ClassHub_API.Models;
 using ClassHub_API.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
 using Newtonsoft.Json;
+using System.Data;
 using System.Security.Claims;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace ClassHub_API.Controllers
 {
@@ -18,73 +20,189 @@ namespace ClassHub_API.Controllers
     {
         private readonly AppDbContext _context;
         private readonly IMqttService _mqttService;
-        private readonly IHubContext<CabinetHub> _hubContext;
+        private readonly ILogger<CabinetController> _logger;
 
-        public CabinetController(
-            AppDbContext context,
-            IMqttService mqttService,
-            IHubContext<CabinetHub> hubContext)
+        public CabinetController(AppDbContext context, IMqttService mqttService, ILogger<CabinetController> logger)
         {
             _context = context;
             _mqttService = mqttService;
-            _hubContext = hubContext;
+            _logger = logger;
         }
 
-        [HttpPost("open-door/{id}")]
+        [HttpPost("open-door/{id:int}")]
         public async Task<IActionResult> OpenDoor(int id, [FromBody] OpenDoorDTO request)
         {
-            var maSv = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
-            if (string.IsNullOrEmpty(maSv)) return Unauthorized();
+            string? currentUserId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
 
-            var phieu = await _context.phieu_muon
-                .FirstOrDefaultAsync(p => p.id == id && (p.ma_sv == maSv || p.ma_sv_uy_quyen == maSv));
-            if (phieu == null) return NotFound(new { message = "Không tìm thấy phiếu mượn!" });
-
-            if (phieu.trang_thai == "COMPLETED" || phieu.trang_thai == "CANCELED")
+            if (string.IsNullOrWhiteSpace(currentUserId))
             {
-                return BadRequest(new { message = "Phòng này đã trả hoặc đã hủy, không thể mở tủ!" });
+                return Unauthorized(new
+                {
+                    message = "Không xác định được người dùng."
+                });
             }
 
-            if (phieu.otp != request.Otp)
+            if (request == null || string.IsNullOrWhiteSpace(request.Otp))
             {
-                return BadRequest(new { message = "Mã OTP không chính xác!" });
+                return BadRequest(new
+                {
+                    message = "Vui lòng nhập mã OTP."
+                });
             }
 
-            if (phieu.trang_thai == "PENDING")
-            {
-                phieu.trang_thai = "ACTIVE";
-                phieu.thoi_gian_nhan = DateTime.Now;
-            }
-            phieu.is_cabinet_open = true;
+            string providedOtp = request.Otp.Trim();
 
-            var cabinet = await _context.thiet_bi_iot.FirstOrDefaultAsync(c => c.ma_phong == phieu.ma_phong);
-            if (cabinet != null)
+            if (providedOtp.Length != 6 || providedOtp.Any(character => !char.IsDigit(character)))
             {
-                cabinet.trang_thai_khoa = "UNLOCKED";
-                cabinet.lan_cuoi_online = DateTime.Now;
+                return BadRequest(new
+                {
+                    message = "Mã OTP phải gồm đúng 6 chữ số."
+                });
             }
 
-            await _context.SaveChangesAsync();
+            await using var transaction = await _context.Database.BeginTransactionAsync(IsolationLevel.Serializable);
 
-            // GỬI LỆNH MỞ TỦ ĐẾN TOPIC: backend/cabinet/{ma_phong}/action
-            string topic = $"backend/cabinet/{phieu.ma_phong}/action";
-            var obj = new { id = phieu.id, room = phieu.ma_phong, action = "open" };
-            string payload = JsonConvert.SerializeObject(obj);
+            var borrowingSession = await _context.phieu_muon.FirstOrDefaultAsync(session => session.id == id && (session.ma_sv == currentUserId || session.ma_sv_uy_quyen == currentUserId));
 
-            await _mqttService.PublishAsync(topic, payload);
-            await _mqttService.PublishAsync("tu_thiet_bi/ACTION", payload);
-
-            await _hubContext.Clients.All.SendAsync("CabinetStatusChanged", new
+            if (borrowingSession == null)
             {
-                roomId = phieu.ma_phong,
-                isOpen = true,
-                doorCondition = "Mở",
-                isOnline = true,
-                lockStatus = "UNLOCKED",
-                timestamp = DateTime.Now.ToString("HH:mm:ss")
+                return NotFound(new
+                {
+                    message = "Không tìm thấy phiếu mượn hoặc bạn không có quyền mở tủ."
+                });
+            }
+
+            string[] validStatuses =
+            {
+                "PENDING",
+                "ACTIVE",
+                "IN_USE"
+            };
+
+            if (!validStatuses.Contains(borrowingSession.trang_thai))
+            {
+                return Conflict(new
+                {
+                    message = "Phiếu mượn không còn ở trạng thái được phép mở tủ."
+                });
+            }
+
+            var cabinet = await _context.thiet_bi_iot
+                .FirstOrDefaultAsync(item => item.ma_phong == borrowingSession.ma_phong);
+
+            if (cabinet == null)
+            {
+                return NotFound(new
+                {
+                    message = "Phòng này chưa được gán tủ thông minh."
+                });
+            }
+
+            if (!cabinet.trang_thai_mang)
+            {
+                return StatusCode(StatusCodes.Status503ServiceUnavailable, new
+                {
+                    message = "Tủ đang ngoại tuyến. Vui lòng thử lại sau."
+                });
+            }
+
+            if (cabinet.trang_thai_khoa == "ERROR")
+            {
+                return Conflict(new
+                {
+                    message = "Tủ đang gặp lỗi hoặc được bảo trì."
+                });
+            }
+
+            if (string.IsNullOrWhiteSpace(borrowingSession.otp))
+            {
+                return Conflict(new
+                {
+                    message = "Mã OTP đã được sử dụng. Vui lòng yêu cầu cấp mã mới."
+                });
+            }
+
+            DateTime currentTime = DateTime.Now;
+
+            if (!borrowingSession.otp_expires_at.HasValue || borrowingSession.otp_expires_at.Value <= currentTime)
+            {
+                borrowingSession.otp = null;
+                borrowingSession.otp_expires_at = null;
+
+                await _context.SaveChangesAsync();
+                await transaction.CommitAsync();
+
+                return BadRequest(new
+                {
+                    message = "Mã OTP đã hết hạn. Vui lòng yêu cầu cấp mã mới."
+                });
+            }
+
+            if (!OtpMatches(providedOtp, borrowingSession.otp))
+            {
+                return BadRequest(new
+                {
+                    message = "Mã OTP không chính xác."
+                });
+            }
+
+            string commandId = Guid.NewGuid().ToString("N");
+
+            borrowingSession.otp = null;
+            borrowingSession.otp_expires_at = null;
+
+            _context.nhat_ky_he_thong.Add(new NhatKyHeThong
+            {
+                ma_sv = currentUserId,
+                hanh_dong = "YEU_CAU_MO_TU",
+                chi_tiet = $"Yêu cầu mở tủ phòng {borrowingSession.ma_phong}, " + $"phiếu mượn #{borrowingSession.id}, " + $"commandId: {commandId}",
+                thoi_gian = currentTime,
+                ip_address = Helper.GetClientIp(HttpContext),
+                user_agent = Helper.GetClientOs(Request)
             });
 
-            return Ok(new { message = "Gửi yêu cầu mở cửa thành công!" });
+            await _context.SaveChangesAsync();
+            await transaction.CommitAsync();
+
+            string topic = $"backend/cabinet/{borrowingSession.ma_phong}/action";
+
+            var commandPayload = new
+            {
+                id = borrowingSession.id.ToString(),
+                room = borrowingSession.ma_phong,
+                action = "open",
+                ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+            };
+
+            string payload = JsonConvert.SerializeObject(commandPayload);
+
+            try
+            {
+                await _mqttService.PublishAsync(topic, payload);
+            }
+            catch (Exception exception)
+            {
+                _logger.LogError(exception, "Không thể gửi lệnh mở tủ {RoomId}, commandId {CommandId}", borrowingSession.ma_phong, commandId);
+
+                return StatusCode(StatusCodes.Status503ServiceUnavailable, new
+                {
+                    message = "Không thể gửi lệnh đến tủ. " + "Vui lòng cấp lại OTP và thử lại.",
+                    commandId
+                });
+            }
+
+            return Accepted(new
+            {
+                message = "Đã gửi yêu cầu mở tủ. " + "Hệ thống đang chờ thiết bị xác nhận.",
+                commandId
+            });
+        }
+
+        private static bool OtpMatches(string providedOtp, string storedOtp)
+        {
+            byte[] providedBytes = Encoding.UTF8.GetBytes(providedOtp);
+            byte[] storedBytes = Encoding.UTF8.GetBytes(storedOtp);
+            return providedBytes.Length == storedBytes.Length && CryptographicOperations.FixedTimeEquals(providedBytes, storedBytes);
         }
     }
 }

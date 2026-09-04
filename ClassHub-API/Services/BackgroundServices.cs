@@ -1,5 +1,6 @@
 ﻿using ClassHub_API.Data;
 using ClassHub_API.Hubs;
+using ClassHub_API.Models;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
 using Newtonsoft.Json;
@@ -9,167 +10,290 @@ namespace ClassHub_API.Services
     public class CabinetStatusPayload
     {
         public string? id { get; set; }
-        public string room { get; set; } = null!;
-        public bool isOpen { get; set; }
-        public bool? isOnline { get; set; } = true;
+        public string? room { get; set; }
+        public bool? isOpen { get; set; }
+        public bool? isOnline { get; set; }
         public string? lockState { get; set; }
     }
 
     public class BackgroundServices : BackgroundService
     {
+        private static readonly string[] ActiveStatuses = { "PENDING", "ACTIVE", "IN_USE", "RETURNING" };
+
         private readonly IMqttService _mqttService;
         private readonly IServiceScopeFactory _scopeFactory;
         private readonly IHubContext<CabinetHub> _hubContext;
+        private readonly ILogger<BackgroundServices> _logger;
+        private readonly SemaphoreSlim _messageLock = new(1, 1);
 
         public BackgroundServices(
             IMqttService mqttService,
             IServiceScopeFactory scopeFactory,
-            IHubContext<CabinetHub> hubContext)
+            IHubContext<CabinetHub> hubContext,
+            ILogger<BackgroundServices> logger)
         {
             _mqttService = mqttService;
             _scopeFactory = scopeFactory;
             _hubContext = hubContext;
+            _logger = logger;
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            await Task.Delay(2000, stoppingToken);
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken);
+                await SubscribeToTopicsAsync(stoppingToken);
 
-            // Đăng ký lắng nghe toàn bộ các tin nhắn gửi lên từ IoT
-            await _mqttService.SubscribeAsync("iot/cabinet/+/status", HandleMqttStatusMessage);
-            await _mqttService.SubscribeAsync("iot/cabinet/+/heartbeat", HandleMqttStatusMessage);
-            await _mqttService.SubscribeAsync("tu_thiet_bi/STATUS", HandleMqttStatusMessage); // Backward compatibility
+                using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
 
-            Console.WriteLine(">> [BackgroundService] Da khoi chay MQTT Listener voi tien to 'iot/'");
+                while (await timer.WaitForNextTickAsync(stoppingToken))
+                {
+                    try
+                    {
+                        await CheckOfflineCabinetsAsync();
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Lỗi khi kiểm tra trạng thái offline của tủ.");
+                    }
+                }
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                _logger.LogInformation("BackgroundServices đã dừng.");
+            }
+        }
 
+        private async Task SubscribeToTopicsAsync(CancellationToken stoppingToken)
+        {
             while (!stoppingToken.IsCancellationRequested)
             {
                 try
                 {
-                    await CheckOfflineCabinetsAsync();
+                    await _mqttService.SubscribeAsync("iot/cabinet/+/status", HandleMqttStatusMessage);
+                    await _mqttService.SubscribeAsync("iot/cabinet/+/heartbeat", HandleMqttStatusMessage);
+                    await _mqttService.SubscribeAsync("tu_thiet_bi/STATUS", HandleMqttStatusMessage);
+
+                    _logger.LogInformation("Đã đăng ký các MQTT topic trạng thái tủ.");
+                    return;
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine("[Watchdog Error] " + ex.Message);
+                    _logger.LogError(ex, "Không thể đăng ký MQTT topic. Thử lại sau 5 giây.");
+                    await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
                 }
-
-                await Task.Delay(5000, stoppingToken);
             }
         }
 
-        private async void HandleMqttStatusMessage(string topic, string payload)
+        private void HandleMqttStatusMessage(string topic, string payload)
         {
-            Console.WriteLine($"[MQTT Recv -> {topic}] {payload}");
+            _ = ProcessMqttStatusMessageAsync(topic, payload);
+        }
+
+        private async Task ProcessMqttStatusMessageAsync(string topic, string payload)
+        {
+            await _messageLock.WaitAsync();
 
             try
             {
-                var data = JsonConvert.DeserializeObject<CabinetStatusPayload>(payload);
-                if (data == null) return;
+                _logger.LogInformation("Nhận MQTT từ {Topic}: {Payload}", topic, payload);
 
-                // Tách lấy mã phòng từ topic (VD: iot/cabinet/DTD201/status -> DTD201)
-                if (string.IsNullOrWhiteSpace(data.room) && topic.Contains("/"))
+                var data = JsonConvert.DeserializeObject<CabinetStatusPayload>(payload);
+                if (data == null)
                 {
-                    var parts = topic.Split('/');
-                    if (parts.Length >= 3) data.room = parts[2];
+                    _logger.LogWarning("Payload MQTT không hợp lệ từ topic {Topic}.", topic);
+                    return;
                 }
 
-                if (string.IsNullOrWhiteSpace(data.room)) return;
+                string roomId = ResolveRoomId(topic, data.room);
+                if (string.IsNullOrWhiteSpace(roomId))
+                {
+                    _logger.LogWarning("Không xác định được mã phòng từ topic {Topic}.", topic);
+                    return;
+                }
 
                 using var scope = _scopeFactory.CreateScope();
                 var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
 
-                var cabinet = await dbContext.thiet_bi_iot.FirstOrDefaultAsync(c => c.ma_phong == data.room);
+                DateTime now = DateTime.Now;
+                bool incomingOnline = data.isOnline ?? true;
+                string? incomingLockState = NormalizeLockState(data.lockState);
+                bool hasLockState = data.isOpen.HasValue || incomingLockState != null;
+
+                var cabinet = await dbContext.thiet_bi_iot.FirstOrDefaultAsync(c => c.ma_phong == roomId);
+
                 if (cabinet != null)
                 {
-                    cabinet.lan_cuoi_online = DateTime.Now;
-                    cabinet.trang_thai_mang = true;
-                    cabinet.trang_thai_khoa = data.isOpen ? "UNLOCKED" : "LOCKED";
+                    cabinet.trang_thai_mang = incomingOnline;
+
+                    if (incomingOnline) cabinet.lan_cuoi_online = now;
+
+                    if (hasLockState)
+                    {
+                        cabinet.trang_thai_khoa = incomingLockState ?? (data.isOpen == true ? "UNLOCKED" : "LOCKED");
+                    }
+                }
+                else
+                {
+                    _logger.LogWarning("Không tìm thấy tủ IoT của phòng {RoomId} trong database.", roomId);
                 }
 
-                var activeBooking = await dbContext.phieu_muon
-                    .Where(p => p.ma_phong == data.room && (p.trang_thai == "PENDING" || p.trang_thai == "ACTIVE" || p.trang_thai == "IN_USE"))
+                var borrowingSession = await dbContext.phieu_muon
+                    .Include(p => p.MaSvNavigation)
+                    .Where(p => p.ma_phong == roomId && ActiveStatuses.Contains(p.trang_thai))
                     .OrderByDescending(p => p.thoi_gian_tao)
                     .FirstOrDefaultAsync();
 
-                if (activeBooking != null)
+                bool isUnlocked = incomingLockState == "UNLOCKED"
+                    || (incomingLockState == null && data.isOpen == true);
+
+                bool isLocked = incomingLockState == "LOCKED"
+                    || (incomingLockState == null && data.isOpen == false);
+
+                if (borrowingSession != null && incomingOnline && hasLockState)
                 {
-                    activeBooking.is_cabinet_open = data.isOpen;
-                    if ((activeBooking.trang_thai == "PENDING" || activeBooking.trang_thai == "IN_USE") && data.isOpen)
+                    borrowingSession.is_cabinet_open = isUnlocked;
+
+                    if (isUnlocked && (borrowingSession.trang_thai == "PENDING" || borrowingSession.trang_thai == "IN_USE"))
                     {
-                        activeBooking.trang_thai = "ACTIVE";
-                        if (!activeBooking.thoi_gian_nhan.HasValue)
+                        borrowingSession.trang_thai = "ACTIVE";
+                        borrowingSession.thoi_gian_nhan ??= now;
+                    }
+
+                    if (isLocked && borrowingSession.trang_thai == "RETURNING")
+                    {
+                        borrowingSession.trang_thai = "COMPLETED";
+                        borrowingSession.thoi_gian_tra = now;
+                        borrowingSession.is_cabinet_open = false;
+
+                        dbContext.nhat_ky_he_thong.Add(new NhatKyHeThong
                         {
-                            activeBooking.thoi_gian_nhan = DateTime.Now;
-                        }
+                            ma_sv = borrowingSession.ma_sv_tra ?? borrowingSession.ma_sv,
+                            hanh_dong = LogAction.TRA_PHONG.ToString(),
+                            chi_tiet = $"ESP32 xác nhận đã khóa tủ phòng {roomId}. Phiếu mượn đã hoàn tất.",
+                            thoi_gian = now,
+                            user_agent = "ClassHub IoT"
+                        });
+
+                        _logger.LogInformation(
+                            "Phiếu {SessionId} đã chuyển từ RETURNING sang COMPLETED.",
+                            borrowingSession.id);
                     }
                 }
 
                 await dbContext.SaveChangesAsync();
 
-                string displayStatus = (cabinet?.trang_thai_khoa == "ERROR") ? "Bảo trì" : (activeBooking != null ? "Đang mượn" : "Trống");
-                string borrowerName = activeBooking?.MaSvNavigation?.ho_ten != null
-                    ? $"{activeBooking.MaSvNavigation.ho_ten} ({activeBooking.ma_sv})"
+                bool stillActive = borrowingSession != null && ActiveStatuses.Contains(borrowingSession.trang_thai);
+                string lockStatus = cabinet?.trang_thai_khoa
+                    ?? incomingLockState
+                    ?? (data.isOpen == true ? "UNLOCKED" : "LOCKED");
+
+                string displayStatus;
+
+                if (!incomingOnline || lockStatus == "ERROR")
+                    displayStatus = "Bảo trì";
+                else if (borrowingSession?.trang_thai == "RETURNING")
+                    displayStatus = "Đang xác nhận trả";
+                else if (stillActive)
+                    displayStatus = "Đang mượn";
+                else
+                    displayStatus = "Trống";
+
+                string borrowerName = stillActive && borrowingSession?.MaSvNavigation != null
+                    ? $"{borrowingSession.MaSvNavigation.ho_ten} ({borrowingSession.ma_sv})"
                     : "---";
 
                 await _hubContext.Clients.All.SendAsync("CabinetStatusChanged", new
                 {
-                    roomId = data.room,
-                    isOpen = data.isOpen,
-                    doorCondition = data.isOpen ? "Mở" : "Đóng",
-                    isOnline = true,
+                    roomId,
+                    isOpen = lockStatus == "UNLOCKED",
+                    doorCondition = lockStatus == "UNLOCKED" ? "Mở" : "Đóng",
+                    isOnline = cabinet?.trang_thai_mang ?? incomingOnline,
+                    lockStatus,
                     status = displayStatus,
                     borrower = borrowerName,
-                    lastOnline = DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss")
+                    lastOnline = cabinet?.lan_cuoi_online?.ToString("dd/MM/yyyy HH:mm:ss")
                 });
+            }
+            catch (JsonException ex)
+            {
+                _logger.LogWarning(ex, "Payload MQTT không đúng định dạng JSON từ topic {Topic}.", topic);
             }
             catch (Exception ex)
             {
-                Console.WriteLine("[MQTT Process Error] " + ex.Message);
+                _logger.LogError(ex, "Lỗi khi xử lý trạng thái MQTT từ topic {Topic}.", topic);
+            }
+            finally
+            {
+                _messageLock.Release();
             }
         }
 
         private async Task CheckOfflineCabinetsAsync()
         {
-            using var scope = _scopeFactory.CreateScope();
-            var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            await _messageLock.WaitAsync();
 
-            var onlineCabinets = await dbContext.thiet_bi_iot
-                .Where(c => c.trang_thai_mang == true)
-                .ToListAsync();
-
-            var now = DateTime.Now;
-            bool hasChange = false;
-
-            foreach (var cab in onlineCabinets)
+            try
             {
-                double elapsedSeconds = cab.lan_cuoi_online.HasValue
-                    ? (now - cab.lan_cuoi_online.Value).TotalSeconds
-                    : 9999;
+                using var scope = _scopeFactory.CreateScope();
+                var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
 
-                if (elapsedSeconds > 30)
+                DateTime now = DateTime.Now;
+
+                var timedOutCabinets = await dbContext.thiet_bi_iot
+                    .Where(c => c.trang_thai_mang
+                        && (!c.lan_cuoi_online.HasValue
+                            || EF.Functions.DateDiffSecond(c.lan_cuoi_online.Value, now) > 30))
+                    .ToListAsync();
+
+                if (timedOutCabinets.Count == 0) return;
+
+                foreach (var cabinet in timedOutCabinets)
                 {
-                    cab.trang_thai_mang = false;
-                    hasChange = true;
+                    cabinet.trang_thai_mang = false;
+                    _logger.LogWarning("Tủ {RoomId} đã offline do mất heartbeat.", cabinet.ma_phong);
+                }
 
-                    Console.WriteLine($">> [Watchdog Timeout] Tu {cab.ma_phong} da OFFLINE (Mat tin hieu {(int)elapsedSeconds}s)");
+                await dbContext.SaveChangesAsync();
 
+                foreach (var cabinet in timedOutCabinets)
+                {
                     await _hubContext.Clients.All.SendAsync("CabinetStatusChanged", new
                     {
-                        roomId = cab.ma_phong,
-                        isOpen = cab.trang_thai_khoa == "UNLOCKED",
-                        doorCondition = cab.trang_thai_khoa == "UNLOCKED" ? "Mở" : "Đóng",
+                        roomId = cabinet.ma_phong,
+                        isOpen = cabinet.trang_thai_khoa == "UNLOCKED",
+                        doorCondition = cabinet.trang_thai_khoa == "UNLOCKED" ? "Mở" : "Đóng",
                         isOnline = false,
-                        lockStatus = cab.trang_thai_khoa,
+                        lockStatus = cabinet.trang_thai_khoa,
                         status = "Bảo trì",
-                        timestamp = DateTime.Now.ToString("HH:mm:ss")
+                        timestamp = now.ToString("HH:mm:ss")
                     });
                 }
             }
-
-            if (hasChange)
+            finally
             {
-                await dbContext.SaveChangesAsync();
+                _messageLock.Release();
             }
+        }
+
+        private static string ResolveRoomId(string topic, string? payloadRoom)
+        {
+            if (!string.IsNullOrWhiteSpace(payloadRoom)) return payloadRoom.Trim();
+
+            string[] topicParts = topic.Split('/');
+            return topicParts.Length >= 3 ? topicParts[2].Trim() : string.Empty;
+        }
+
+        private static string? NormalizeLockState(string? lockState)
+        {
+            if (string.IsNullOrWhiteSpace(lockState)) return null;
+
+            string normalizedState = lockState.Trim().ToUpperInvariant();
+
+            return normalizedState is "LOCKED" or "UNLOCKED" or "ERROR"
+                ? normalizedState
+                : null;
         }
     }
 }

@@ -1,11 +1,11 @@
 ﻿using ClassHub_API.Data;
 using ClassHub_API.DTOs;
 using ClassHub_API.Models;
+using ClassHub_API.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
-using System.Security.Cryptography;
-using System.Text;
+using System.Security.Claims;
 
 namespace ClassHub_API.Controllers
 {
@@ -14,28 +14,31 @@ namespace ClassHub_API.Controllers
     [Authorize(Roles = "ADMIN")]
     public class AdminBuildingsController : ControllerBase
     {
-        private readonly AppDbContext _context;
+        private static readonly string[] ActiveStatuses = { "PENDING", "ACTIVE", "IN_USE", "RETURNING" };
+        private static readonly string[] ValidRoomStatuses = { "HOAT_DONG", "BAO_TRI", "TAM_KHOA" };
 
-        public AdminBuildingsController(AppDbContext context)
+        private readonly AppDbContext _context;
+        private readonly ILogger<AdminBuildingsController> _logger;
+
+        public AdminBuildingsController(AppDbContext context, ILogger<AdminBuildingsController> logger)
         {
             _context = context;
+            _logger = logger;
         }
-
-        // =========================================================================
-        // 1. QUẢN LÝ TÒA NHÀ (BUILDINGS)
-        // =========================================================================
 
         [HttpGet("buildings")]
         public async Task<IActionResult> GetAllBuildings()
         {
             var buildings = await _context.toa_nha
-                .Select(b => new
+                .AsNoTracking()
+                .OrderBy(building => building.ma_toa_nha)
+                .Select(building => new
                 {
-                    id = b.ma_toa_nha,
-                    name = b.ten_toa_nha,
-                    floors = b.so_tang ?? 5,
-                    rooms = _context.phong_hoc.Count(p => p.ma_toa_nha == b.ma_toa_nha),
-                    description = b.mo_ta ?? ""
+                    id = building.ma_toa_nha,
+                    name = building.ten_toa_nha,
+                    floors = building.so_tang ?? 1,
+                    rooms = building.PhongHocs.Count,
+                    description = building.mo_ta ?? string.Empty
                 })
                 .ToListAsync();
 
@@ -45,185 +48,448 @@ namespace ClassHub_API.Controllers
         [HttpPost("buildings")]
         public async Task<IActionResult> CreateBuilding([FromBody] CreateBuildingDTO dto)
         {
-            if (string.IsNullOrWhiteSpace(dto.Id) || string.IsNullOrWhiteSpace(dto.Name))
-            {
-                return BadRequest(new { message = "Vui lòng nhập đầy đủ Mã tòa và Tên tòa nhà!" });
-            }
+            if (dto == null || string.IsNullOrWhiteSpace(dto.Id) || string.IsNullOrWhiteSpace(dto.Name))
+                return BadRequest(new { message = "Vui lòng nhập mã và tên tòa nhà." });
 
-            var trimmedId = dto.Id.Trim().ToUpper();
-            if (await _context.toa_nha.AnyAsync(b => b.ma_toa_nha == trimmedId))
-            {
-                return BadRequest(new { message = "Mã tòa nhà này đã tồn tại!" });
-            }
+            string buildingId = dto.Id.Trim().ToUpperInvariant();
+            string buildingName = dto.Name.Trim();
+            string? description = NormalizeOptionalValue(dto.Description);
+
+            if (buildingId.Length > 50)
+                return BadRequest(new { message = "Mã tòa nhà không được vượt quá 50 ký tự." });
+
+            if (buildingName.Length > 255)
+                return BadRequest(new { message = "Tên tòa nhà không được vượt quá 255 ký tự." });
+
+            if (description?.Length > 255)
+                return BadRequest(new { message = "Mô tả không được vượt quá 255 ký tự." });
+
+            if (dto.Floors <= 0 || dto.Floors > 100)
+                return BadRequest(new { message = "Số tầng phải nằm trong khoảng từ 1 đến 100." });
+
+            bool buildingExists = await _context.toa_nha
+                .AsNoTracking()
+                .AnyAsync(building => building.ma_toa_nha == buildingId);
+
+            if (buildingExists)
+                return Conflict(new { message = "Mã tòa nhà đã tồn tại." });
 
             var building = new ToaNha
             {
-                ma_toa_nha = trimmedId,
-                ten_toa_nha = dto.Name.Trim(),
-                so_tang = dto.Floors > 0 ? dto.Floors : 5,
-                mo_ta = dto.Description?.Trim()
+                ma_toa_nha = buildingId,
+                ten_toa_nha = buildingName,
+                so_tang = dto.Floors,
+                mo_ta = description
             };
 
             _context.toa_nha.Add(building);
-            await _context.SaveChangesAsync();
+            AddAuditLog("TAO_TOA_NHA", $"Tạo tòa nhà {buildingId} - {buildingName}.");
 
-            return Ok(new { message = $"Đã thêm tòa nhà {building.ten_toa_nha} thành công!" });
+            try
+            {
+                await _context.SaveChangesAsync();
+            }
+            catch (DbUpdateException ex)
+            {
+                _logger.LogWarning(ex, "Trùng dữ liệu khi tạo tòa nhà {BuildingId}.", buildingId);
+                return Conflict(new { message = "Mã tòa nhà đã tồn tại." });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Không thể tạo tòa nhà {BuildingId}.", buildingId);
+                return StatusCode(StatusCodes.Status500InternalServerError, new { message = "Không thể tạo tòa nhà." });
+            }
+
+            return StatusCode(StatusCodes.Status201Created, new
+            {
+                message = $"Đã thêm tòa nhà {buildingName}."
+            });
         }
 
         [HttpPut("buildings/{id}")]
         public async Task<IActionResult> UpdateBuilding(string id, [FromBody] UpdateBuildingDTO dto)
         {
-            var building = await _context.toa_nha.FindAsync(id);
-            if (building == null) return NotFound(new { message = "Không tìm thấy tòa nhà!" });
+            if (string.IsNullOrWhiteSpace(id) || dto == null)
+                return BadRequest(new { message = "Dữ liệu tòa nhà không hợp lệ." });
 
-            building.ten_toa_nha = dto.Name.Trim();
+            string buildingId = id.Trim().ToUpperInvariant();
+
+            var building = await _context.toa_nha.FindAsync(buildingId);
+            if (building == null) return NotFound(new { message = "Không tìm thấy tòa nhà." });
+
+            if (string.IsNullOrWhiteSpace(dto.Name))
+                return BadRequest(new { message = "Tên tòa nhà không được để trống." });
+
+            string buildingName = dto.Name.Trim();
+            string? description = NormalizeOptionalValue(dto.Description);
+
+            if (buildingName.Length > 255)
+                return BadRequest(new { message = "Tên tòa nhà không được vượt quá 255 ký tự." });
+
+            if (description?.Length > 255)
+                return BadRequest(new { message = "Mô tả không được vượt quá 255 ký tự." });
+
+            if (dto.Floors <= 0 || dto.Floors > 100)
+                return BadRequest(new { message = "Số tầng phải nằm trong khoảng từ 1 đến 100." });
+
+            int highestRoomFloor = await _context.phong_hoc
+                .Where(room => room.ma_toa_nha == buildingId)
+                .Select(room => (int?)room.tang)
+                .MaxAsync() ?? 0;
+
+            if (dto.Floors < highestRoomFloor)
+            {
+                return BadRequest(new
+                {
+                    message = $"Không thể giảm xuống {dto.Floors} tầng vì đang có phòng ở tầng {highestRoomFloor}."
+                });
+            }
+
+            building.ten_toa_nha = buildingName;
             building.so_tang = dto.Floors;
-            building.mo_ta = dto.Description?.Trim();
+            building.mo_ta = description;
 
-            await _context.SaveChangesAsync();
-            return Ok(new { message = "Cập nhật tòa nhà thành công!" });
+            AddAuditLog("CAP_NHAT_TOA_NHA", $"Cập nhật tòa nhà {buildingId}.");
+
+            try
+            {
+                await _context.SaveChangesAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Không thể cập nhật tòa nhà {BuildingId}.", buildingId);
+                return StatusCode(StatusCodes.Status500InternalServerError, new { message = "Không thể cập nhật tòa nhà." });
+            }
+
+            return Ok(new { message = "Cập nhật tòa nhà thành công." });
         }
 
         [HttpDelete("buildings/{id}")]
         public async Task<IActionResult> DeleteBuilding(string id)
         {
-            var building = await _context.toa_nha.FindAsync(id);
-            if (building == null) return NotFound(new { message = "Không tìm thấy tòa nhà!" });
+            if (string.IsNullOrWhiteSpace(id))
+                return BadRequest(new { message = "Mã tòa nhà không hợp lệ." });
 
-            var hasRooms = await _context.phong_hoc.AnyAsync(p => p.ma_toa_nha == id);
+            string buildingId = id.Trim().ToUpperInvariant();
+
+            var building = await _context.toa_nha.FindAsync(buildingId);
+            if (building == null) return NotFound(new { message = "Không tìm thấy tòa nhà." });
+
+            bool hasRooms = await _context.phong_hoc
+                .AsNoTracking()
+                .AnyAsync(room => room.ma_toa_nha == buildingId);
+
             if (hasRooms)
-            {
-                return BadRequest(new { message = "Không thể xóa: Tòa nhà này đang có các phòng học trực thuộc!" });
-            }
+                return BadRequest(new { message = "Không thể xóa tòa nhà đang có phòng học trực thuộc." });
 
             _context.toa_nha.Remove(building);
-            await _context.SaveChangesAsync();
+            AddAuditLog("XOA_TOA_NHA", $"Xóa tòa nhà {buildingId} - {building.ten_toa_nha}.");
 
-            return Ok(new { message = "Đã xóa tòa nhà thành công!" });
+            try
+            {
+                await _context.SaveChangesAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Không thể xóa tòa nhà {BuildingId}.", buildingId);
+                return StatusCode(StatusCodes.Status500InternalServerError, new { message = "Không thể xóa tòa nhà." });
+            }
+
+            return Ok(new { message = "Đã xóa tòa nhà." });
         }
-
-        // =========================================================================
-        // 2. QUẢN LÝ PHÒNG HỌC (ROOMS)
-        // =========================================================================
 
         [HttpGet("rooms")]
         public async Task<IActionResult> GetAllRooms()
         {
-            var today = DateTime.Today;
-            var tomorrow = today.AddDays(1);
+            DateTime today = DateTime.Today;
+            DateTime tomorrow = today.AddDays(1);
 
-            var activeBookings = await _context.phieu_muon
-                .Where(p => (p.trang_thai == "ACTIVE" || p.trang_thai == "PENDING" || p.trang_thai == "IN_USE")
-                         && p.ngay_muon >= today && p.ngay_muon < tomorrow)
-                .Select(p => p.ma_phong)
-                .ToListAsync();
-
-            var rooms = await _context.phong_hoc
-                .Include(p => p.MaToaNhaNavigation)
-                .Select(p => new
+            var activeSessions = await _context.phieu_muon
+                .AsNoTracking()
+                .Where(session => ActiveStatuses.Contains(session.trang_thai))
+                .Select(session => new
                 {
-                    id = p.ma_phong,
-                    name = p.ten_phong,
-                    buildingId = p.ma_toa_nha,
-                    building = p.MaToaNhaNavigation != null ? p.MaToaNhaNavigation.ten_toa_nha : p.ma_toa_nha,
-                    floor = $"Tầng {p.tang}",
-                    floorNum = p.tang,
-                    capacity = p.suc_chua ?? 70,
-                    rawStatus = p.trang_thai,
-                    status = p.trang_thai == "BAO_TRI" ? "Bảo trì" :
-                             p.trang_thai == "TAM_KHOA" ? "Tạm khóa" :
-                             activeBookings.Contains(p.ma_phong) ? "Đang mượn" : "Sẵn sàng"
+                    session.ma_phong,
+                    session.trang_thai,
+                    session.ngay_muon,
+                    session.thoi_gian_tao
                 })
                 .ToListAsync();
 
-            return Ok(rooms);
+            var currentSessions = activeSessions
+                .Where(session => session.trang_thai != "PENDING"
+                    || (session.ngay_muon >= today && session.ngay_muon < tomorrow))
+                .GroupBy(session => session.ma_phong)
+                .ToDictionary(
+                    group => group.Key,
+                    group => group.OrderByDescending(session => session.thoi_gian_tao).First());
+
+            var cabinets = await _context.thiet_bi_iot
+                .AsNoTracking()
+                .Where(cabinet => cabinet.ma_phong != null)
+                .ToDictionaryAsync(cabinet => cabinet.ma_phong!);
+
+            var rooms = await _context.phong_hoc
+                .AsNoTracking()
+                .Include(room => room.MaToaNhaNavigation)
+                .OrderBy(room => room.ma_toa_nha)
+                .ThenBy(room => room.tang)
+                .ThenBy(room => room.ma_phong)
+                .ToListAsync();
+
+            var result = rooms.Select(room =>
+            {
+                currentSessions.TryGetValue(room.ma_phong, out var currentSession);
+                cabinets.TryGetValue(room.ma_phong, out var cabinet);
+
+                return new
+                {
+                    id = room.ma_phong,
+                    name = room.ten_phong,
+                    buildingId = room.ma_toa_nha,
+                    building = room.MaToaNhaNavigation?.ten_toa_nha ?? room.ma_toa_nha,
+                    floor = $"Tầng {room.tang}",
+                    floorNum = room.tang,
+                    capacity = room.suc_chua ?? 0,
+                    rawStatus = room.trang_thai,
+                    status = GetRoomDisplayStatus(room.trang_thai, cabinet, currentSession?.trang_thai),
+                    hasCabinet = cabinet != null,
+                    isOnline = cabinet?.trang_thai_mang ?? false
+                };
+            });
+
+            return Ok(result);
         }
 
         [HttpPost("rooms")]
         public async Task<IActionResult> CreateRoom([FromBody] CreateRoomDTO dto)
         {
-            if (string.IsNullOrWhiteSpace(dto.Id) || string.IsNullOrWhiteSpace(dto.Name) || string.IsNullOrWhiteSpace(dto.BuildingId))
+            if (dto == null
+                || string.IsNullOrWhiteSpace(dto.Id)
+                || string.IsNullOrWhiteSpace(dto.Name)
+                || string.IsNullOrWhiteSpace(dto.BuildingId))
             {
-                return BadRequest(new { message = "Vui lòng nhập đầy đủ Mã phòng, Tên phòng và Tòa nhà!" });
+                return BadRequest(new { message = "Vui lòng nhập mã phòng, tên phòng và tòa nhà." });
             }
 
-            var trimmedId = dto.Id.Trim().ToUpper();
-            if (await _context.phong_hoc.AnyAsync(p => p.ma_phong == trimmedId))
-            {
-                return BadRequest(new { message = "Mã phòng học này đã tồn tại!" });
-            }
+            string roomId = dto.Id.Trim().ToUpperInvariant();
+            string roomName = dto.Name.Trim();
+            string buildingId = dto.BuildingId.Trim().ToUpperInvariant();
+            string? roomStatus = NormalizeRoomStatus(dto.Status);
+
+            if (roomId.Length > 50)
+                return BadRequest(new { message = "Mã phòng không được vượt quá 50 ký tự." });
+
+            if (roomName.Length > 255)
+                return BadRequest(new { message = "Tên phòng không được vượt quá 255 ký tự." });
+
+            if (roomStatus == null)
+                return BadRequest(new { message = "Trạng thái phòng không hợp lệ." });
+
+            if (dto.Capacity <= 0 || dto.Capacity > 1000)
+                return BadRequest(new { message = "Sức chứa phải nằm trong khoảng từ 1 đến 1000." });
+
+            var building = await _context.toa_nha
+                .AsNoTracking()
+                .FirstOrDefaultAsync(item => item.ma_toa_nha == buildingId);
+
+            if (building == null) return BadRequest(new { message = "Tòa nhà không tồn tại." });
+
+            int buildingFloors = building.so_tang ?? 1;
+
+            if (dto.Floor <= 0 || dto.Floor > buildingFloors)
+                return BadRequest(new { message = $"Tầng phải nằm trong khoảng từ 1 đến {buildingFloors}." });
+
+            bool roomExists = await _context.phong_hoc
+                .AsNoTracking()
+                .AnyAsync(room => room.ma_phong == roomId);
+
+            if (roomExists)
+                return Conflict(new { message = "Mã phòng đã tồn tại." });
 
             var room = new PhongHoc
             {
-                ma_phong = trimmedId,
-                ten_phong = dto.Name.Trim(),
-                tang = dto.Floor > 0 ? dto.Floor : 1,
-                suc_chua = dto.Capacity > 0 ? dto.Capacity : 70,
-                ma_toa_nha = dto.BuildingId,
-                trang_thai = dto.Status ?? "HOAT_DONG"
+                ma_phong = roomId,
+                ten_phong = roomName,
+                tang = dto.Floor,
+                suc_chua = dto.Capacity,
+                ma_toa_nha = buildingId,
+                trang_thai = roomStatus
             };
 
             _context.phong_hoc.Add(room);
+            AddAuditLog("TAO_PHONG_HOC", $"Tạo phòng {roomId} tại tòa nhà {buildingId}.");
 
-            // Tự động sinh Tủ đồ IoT thông minh tương ứng với phòng mới tạo (1 phòng = 1 tủ)
-            string macHash;
-            using (var md5 = MD5.Create())
+            try
             {
-                var hash = md5.ComputeHash(Encoding.UTF8.GetBytes(trimmedId));
-                macHash = Convert.ToHexString(hash);
+                await _context.SaveChangesAsync();
             }
-            string uniqueMac = $"24:6F:28:{macHash.Substring(0, 2)}:{macHash.Substring(2, 2)}:{macHash.Substring(4, 2)}";
-
-            var cabinet = new ThietBiIot
+            catch (DbUpdateException ex)
             {
-                ma_phong = trimmedId,
-                ten_tu = $"Tủ SmartHub {room.ten_phong}",
-                mac_address = uniqueMac,
-                mqtt_topic = $"classhub/cabinet/{trimmedId}",
-                trang_thai_mang = true,
-                trang_thai_khoa = "LOCKED",
-                firmware_version = "v1.2.0",
-                lan_cuoi_online = DateTime.Now
-            };
+                _logger.LogWarning(ex, "Trùng dữ liệu khi tạo phòng {RoomId}.", roomId);
+                return Conflict(new { message = "Mã phòng đã tồn tại." });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Không thể tạo phòng {RoomId}.", roomId);
+                return StatusCode(StatusCodes.Status500InternalServerError, new { message = "Không thể tạo phòng học." });
+            }
 
-            _context.thiet_bi_iot.Add(cabinet);
-            await _context.SaveChangesAsync();
-
-            return Ok(new { message = $"Đã thêm phòng {room.ten_phong} và kích hoạt Tủ thông minh IoT thành công!" });
+            return StatusCode(StatusCodes.Status201Created, new
+            {
+                message = $"Đã thêm phòng {roomName}. Hãy đăng ký tủ IoT vật lý cho phòng này.",
+                roomId
+            });
         }
 
         [HttpPut("rooms/{id}")]
         public async Task<IActionResult> UpdateRoom(string id, [FromBody] UpdateRoomDTO dto)
         {
-            var room = await _context.phong_hoc.FindAsync(id);
-            if (room == null) return NotFound(new { message = "Không tìm thấy phòng học!" });
+            if (string.IsNullOrWhiteSpace(id) || dto == null)
+                return BadRequest(new { message = "Dữ liệu phòng học không hợp lệ." });
 
-            room.ten_phong = dto.Name.Trim();
+            string roomId = id.Trim().ToUpperInvariant();
+
+            var room = await _context.phong_hoc.FindAsync(roomId);
+            if (room == null) return NotFound(new { message = "Không tìm thấy phòng học." });
+
+            if (string.IsNullOrWhiteSpace(dto.Name) || string.IsNullOrWhiteSpace(dto.BuildingId))
+                return BadRequest(new { message = "Tên phòng và tòa nhà không được để trống." });
+
+            string roomName = dto.Name.Trim();
+            string buildingId = dto.BuildingId.Trim().ToUpperInvariant();
+            string? roomStatus = NormalizeRoomStatus(dto.Status ?? room.trang_thai);
+
+            if (roomName.Length > 255)
+                return BadRequest(new { message = "Tên phòng không được vượt quá 255 ký tự." });
+
+            if (roomStatus == null)
+                return BadRequest(new { message = "Trạng thái phòng không hợp lệ." });
+
+            if (dto.Capacity <= 0 || dto.Capacity > 1000)
+                return BadRequest(new { message = "Sức chứa phải nằm trong khoảng từ 1 đến 1000." });
+
+            var building = await _context.toa_nha
+                .AsNoTracking()
+                .FirstOrDefaultAsync(item => item.ma_toa_nha == buildingId);
+
+            if (building == null) return BadRequest(new { message = "Tòa nhà không tồn tại." });
+
+            int buildingFloors = building.so_tang ?? 1;
+
+            if (dto.Floor <= 0 || dto.Floor > buildingFloors)
+                return BadRequest(new { message = $"Tầng phải nằm trong khoảng từ 1 đến {buildingFloors}." });
+
+            room.ten_phong = roomName;
             room.tang = dto.Floor;
             room.suc_chua = dto.Capacity;
-            room.ma_toa_nha = dto.BuildingId;
-            room.trang_thai = dto.Status ?? room.trang_thai;
+            room.ma_toa_nha = buildingId;
+            room.trang_thai = roomStatus;
 
-            await _context.SaveChangesAsync();
-            return Ok(new { message = "Cập nhật phòng học thành công!" });
+            AddAuditLog("CAP_NHAT_PHONG_HOC", $"Cập nhật phòng {roomId}.");
+
+            try
+            {
+                await _context.SaveChangesAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Không thể cập nhật phòng {RoomId}.", roomId);
+                return StatusCode(StatusCodes.Status500InternalServerError, new { message = "Không thể cập nhật phòng học." });
+            }
+
+            return Ok(new { message = "Cập nhật phòng học thành công." });
         }
 
         [HttpDelete("rooms/{id}")]
         public async Task<IActionResult> DeleteRoom(string id)
         {
-            var room = await _context.phong_hoc.FindAsync(id);
-            if (room == null) return NotFound(new { message = "Không tìm thấy phòng học!" });
+            if (string.IsNullOrWhiteSpace(id))
+                return BadRequest(new { message = "Mã phòng không hợp lệ." });
 
-            var hasBookings = await _context.phieu_muon.AnyAsync(p => p.ma_phong == id);
-            if (hasBookings)
+            string roomId = id.Trim().ToUpperInvariant();
+
+            var room = await _context.phong_hoc.FindAsync(roomId);
+            if (room == null) return NotFound(new { message = "Không tìm thấy phòng học." });
+
+            bool hasActiveSession = await _context.phieu_muon
+                .AsNoTracking()
+                .AnyAsync(session => session.ma_phong == roomId && ActiveStatuses.Contains(session.trang_thai));
+
+            if (hasActiveSession)
+                return BadRequest(new { message = "Không thể vô hiệu hóa phòng đang có phiên mượn chưa hoàn tất." });
+
+            if (room.trang_thai == "TAM_KHOA")
+                return Ok(new { message = "Phòng đã được vô hiệu hóa từ trước." });
+
+            room.trang_thai = "TAM_KHOA";
+            AddAuditLog("VO_HIEU_HOA_PHONG_HOC", $"Vô hiệu hóa phòng {roomId}. Dữ liệu lịch sử được giữ lại.");
+
+            try
             {
-                return BadRequest(new { message = "Không thể xóa: Phòng học này đã có lịch sử mượn phòng!" });
+                await _context.SaveChangesAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Không thể vô hiệu hóa phòng {RoomId}.", roomId);
+
+                return StatusCode(
+                    StatusCodes.Status500InternalServerError,
+                    new { message = "Không thể vô hiệu hóa phòng học." });
             }
 
-            _context.phong_hoc.Remove(room);
-            await _context.SaveChangesAsync();
+            return Ok(new
+            {
+                message = "Đã vô hiệu hóa phòng học. Dữ liệu tủ và lịch sử vẫn được giữ lại.",
+                status = "TAM_KHOA"
+            });
+        }
 
-            return Ok(new { message = "Đã xóa phòng học thành công!" });
+        private void AddAuditLog(string action, string detail)
+        {
+            string? adminId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+
+            _context.nhat_ky_he_thong.Add(new NhatKyHeThong
+            {
+                ma_sv = adminId,
+                hanh_dong = action,
+                chi_tiet = detail,
+                thoi_gian = DateTime.Now,
+                ip_address = Helper.GetClientIp(HttpContext),
+                user_agent = Helper.GetClientOs(Request)
+            });
+        }
+
+        private static string? NormalizeRoomStatus(string? status)
+        {
+            if (string.IsNullOrWhiteSpace(status)) return "HOAT_DONG";
+
+            string normalizedStatus = status.Trim().ToUpperInvariant();
+
+            return ValidRoomStatuses.Contains(normalizedStatus)
+                ? normalizedStatus
+                : null;
+        }
+
+        private static string GetRoomDisplayStatus(
+            string roomStatus,
+            ThietBiIot? cabinet,
+            string? borrowingStatus)
+        {
+            if (roomStatus == "BAO_TRI") return "Bảo trì";
+            if (roomStatus == "TAM_KHOA") return "Tạm khóa";
+            if (cabinet == null) return "Chưa có tủ IoT";
+            if (!cabinet.trang_thai_mang) return "Mất kết nối";
+            if (borrowingStatus == "RETURNING") return "Đang xác nhận trả";
+            if (borrowingStatus is "ACTIVE" or "IN_USE") return "Đang mượn";
+            if (borrowingStatus == "PENDING") return "Đã đặt";
+
+            return "Sẵn sàng";
+        }
+
+        private static string? NormalizeOptionalValue(string? value)
+        {
+            return string.IsNullOrWhiteSpace(value) ? null : value.Trim();
         }
     }
 }

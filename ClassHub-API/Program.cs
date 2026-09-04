@@ -1,4 +1,5 @@
 ﻿using ClassHub_API.Data;
+using ClassHub_API.Hubs;
 using ClassHub_API.Interfaces;
 using ClassHub_API.Services;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
@@ -14,52 +15,124 @@ namespace ClassHub_API
         {
             var builder = WebApplication.CreateBuilder(args);
 
+            string connectionString =
+                builder.Configuration.GetConnectionString("DefaultConnection")
+                ?? throw new InvalidOperationException(
+                    "Thiếu ConnectionStrings:DefaultConnection trong User Secrets.");
+
+            string jwtSecret =
+                builder.Configuration["JwtSettings:SecretKey"]
+                ?? throw new InvalidOperationException(
+                    "Thiếu JwtSettings:SecretKey trong User Secrets.");
+
+            string jwtIssuer =
+                builder.Configuration["JwtSettings:Issuer"]
+                ?? throw new InvalidOperationException(
+                    "Thiếu JwtSettings:Issuer trong appsettings.json.");
+
+            string jwtAudience =
+                builder.Configuration["JwtSettings:Audience"]
+                ?? throw new InvalidOperationException(
+                    "Thiếu JwtSettings:Audience trong appsettings.json.");
+
+            if (Encoding.UTF8.GetByteCount(jwtSecret) < 32)
+            {
+                throw new InvalidOperationException("JwtSettings:SecretKey phải có ít nhất 32 byte.");
+            }
+
+            string[] allowedOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? Array.Empty<string>();
+
             builder.Services.AddControllers();
             builder.Services.AddEndpointsApiExplorer();
             builder.Services.AddSwaggerGen();
+            builder.Services.AddProblemDetails();
+            builder.Services.AddHealthChecks();
+            builder.Services.AddSignalR();
+
+            builder.Services.AddDbContext<AppDbContext>(options =>
+            {
+                options.UseMySql(connectionString, ServerVersion.AutoDetect(connectionString));
+            });
+
             builder.Services.AddScoped<ITokenService, TokenService>();
             builder.Services.AddSingleton<IMqttService, MqttService>();
-            builder.Services.AddHostedService<ClassHub_API.Services.BackgroundServices>();
+            builder.Services.AddHostedService<BackgroundServices>();
 
-            var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
-            builder.Services.AddDbContext<AppDbContext>(options =>
-                options.UseMySql(
-                    builder.Configuration.GetConnectionString("DefaultConnection"),
-                    ServerVersion.AutoDetect(builder.Configuration.GetConnectionString("DefaultConnection"))
-                ));
-
-
-            var jwtSettings = builder.Configuration.GetSection("JwtSettings");
-            var secretKey = jwtSettings["SecretKey"];
-
-            builder.Services.AddAuthentication(options =>
+            builder.Services
+            .AddAuthentication(options =>
             {
                 options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+
                 options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
             })
             .AddJwtBearer(options =>
             {
-                options.TokenValidationParameters = new TokenValidationParameters
+                options.TokenValidationParameters =
+                    new TokenValidationParameters
+                    {
+                        ValidateIssuer = true,
+                        ValidateAudience = true,
+                        ValidateLifetime = true,
+                        ValidateIssuerSigningKey = true,
+
+                        ValidIssuer = jwtIssuer,
+                        ValidAudience = jwtAudience,
+
+                        IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret)),
+
+                        ClockSkew = TimeSpan.FromMinutes(1)
+                    };
+
+                options.Events = new JwtBearerEvents
                 {
-                    ValidateIssuer = true,
-                    ValidateAudience = true,
-                    ValidateLifetime = true,
-                    ValidateIssuerSigningKey = true,
-                    ValidIssuer = jwtSettings["Issuer"],
-                    ValidAudience = jwtSettings["Audience"],
-                    IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secretKey))
+                    OnMessageReceived = context =>
+                    {
+                        string accessToken =
+                            context.Request.Query["access_token"].ToString();
+
+                        PathString requestPath = context.HttpContext.Request.Path;
+
+                        if (!string.IsNullOrWhiteSpace(accessToken) && requestPath.StartsWithSegments("/hub/cabinet"))
+                        {
+                            context.Token = accessToken;
+                        }
+
+                        return Task.CompletedTask;
+                    }
                 };
             });
 
-            builder.Services.AddSignalR();
+            builder.Services.AddAuthorization();
+
             builder.Services.AddCors(options =>
             {
-                options.AddPolicy("CorsPolicy", policy =>
+                options.AddPolicy("FrontendPolicy", policy =>
                 {
-                    policy.SetIsOriginAllowed(origin => true)
-                          .AllowAnyHeader()
-                          .AllowAnyMethod()
-                          .AllowCredentials();
+                    if (allowedOrigins.Length > 0)
+                    {
+                        policy
+                            .WithOrigins(allowedOrigins)
+                            .AllowAnyHeader()
+                            .AllowAnyMethod()
+                            .AllowCredentials();
+
+                        return;
+                    }
+
+                    if (builder.Environment.IsDevelopment())
+                    {
+                        policy
+                            .SetIsOriginAllowed(_ => true)
+                            .AllowAnyHeader()
+                            .AllowAnyMethod()
+                            .AllowCredentials();
+
+                        return;
+                    }
+
+                    throw new InvalidOperationException(
+                        "Phải cấu hình Cors:AllowedOrigins "
+                        + "khi chạy ngoài môi trường Development.");
                 });
             });
 
@@ -67,6 +140,7 @@ namespace ClassHub_API
 
             var app = builder.Build();
 
+            app.UseExceptionHandler();
 
             if (app.Environment.IsDevelopment())
             {
@@ -74,11 +148,14 @@ namespace ClassHub_API
                 app.UseSwaggerUI();
             }
 
-            app.UseCors("CorsPolicy");
+            app.UseCors("FrontendPolicy");
+
             app.UseAuthentication();
             app.UseAuthorization();
+
             app.MapControllers();
-            app.MapHub<ClassHub_API.Hubs.CabinetHub>("/hub/cabinet");
+            app.MapHub<CabinetHub>("/hub/cabinet");
+            app.MapHealthChecks("/health");
 
             app.Run();
         }
