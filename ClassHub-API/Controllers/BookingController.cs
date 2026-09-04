@@ -127,8 +127,8 @@ namespace ClassHub_API.Controllers
                     hanh_dong = "TAO_PHIEU_MUON",
                     chi_tiet = $"{userRole} Đăng ký mượn phòng {phieuMoi.ma_phong} ",
                     thoi_gian = DateTime.Now,
-                    ip_address = OtherHelper.GetClientIp(HttpContext),
-                    user_agent = OtherHelper.GetClientOs(Request)
+                    ip_address = Helper.GetClientIp(HttpContext),
+                    user_agent = Helper.GetClientOs(Request)
                 };
                 _context.nhat_ky_he_thong.Add(log);
 
@@ -202,11 +202,11 @@ namespace ClassHub_API.Controllers
             var log = new NhatKyHeThong
             {
                 ma_sv = maSv,
-                hanh_dong = "TRA_PHONG",
+                hanh_dong = LogAction.TRA_PHONG.ToString(),
                 chi_tiet = $"{userRole} Hoàn tất trả thiết bị phòng {room} ",
                 thoi_gian = DateTime.Now,
-                ip_address = OtherHelper.GetClientIp(HttpContext),
-                user_agent = OtherHelper.GetClientOs(Request)
+                ip_address = Helper.GetClientIp(HttpContext),
+                user_agent = Helper.GetClientOs(Request)
             };
             _context.nhat_ky_he_thong.Add(log);
 

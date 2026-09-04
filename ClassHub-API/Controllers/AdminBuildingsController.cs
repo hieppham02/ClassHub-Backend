@@ -11,7 +11,7 @@ namespace ClassHub_API.Controllers
 {
     [Route("api/admin")]
     [ApiController]
-    [Authorize] // Bắt buộc đăng nhập quyền Admin
+    [Authorize(Roles = "ADMIN")]
     public class AdminBuildingsController : ControllerBase
     {
         private readonly AppDbContext _context;
