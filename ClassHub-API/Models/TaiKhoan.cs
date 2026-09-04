@@ -1,27 +1,41 @@
-﻿
+﻿using System;
+using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 using System.ComponentModel.DataAnnotations.Schema;
 
-namespace ClassHub_API.Models;
-
-[Table("tai_khoan")]
-public partial class TaiKhoan
+namespace ClassHub_API.Models
 {
-    [Key]
-    public string ma_sv { get; set; } = null!;
+    [Table("tai_khoan")]
+    public class TaiKhoan
+    {
+        [Key]
+        [Column("ma_sv")]
+        public string ma_sv { get; set; } = null!;
 
-    public string email { get; set; } = null!;
+        [Column("email")]
+        public string email { get; set; } = null!;
 
-    public string ho_ten { get; set; } = null!;
+        [Column("ho_ten")]
+        public string ho_ten { get; set; } = null!;
 
-    public string mat_khau { get; set; } = null!;
+        [Column("mat_khau")]
+        public string mat_khau { get; set; } = null!;
 
-    public string? sdt { get; set; }
+        [Column("sdt")]
+        public string? sdt { get; set; }
 
-    public string vai_tro { get; set; } = null!;
+        [Column("vai_tro")]
+        public string vai_tro { get; set; } = "SINHVIEN";
 
-    public string? ten_lop { get; set; }
+        [Column("ten_lop")]
+        public string? ten_lop { get; set; }
 
-    [InverseProperty("MaSvNavigation")]
-    public virtual ICollection<PhieuMuon> PhieuMuons { get; set; } = new List<PhieuMuon>();
+        [Column("trang_thai")]
+        public bool trang_thai { get; set; } = true;
+
+        [Column("ngay_tao")]
+        public DateTime ngay_tao { get; set; } = DateTime.Now;
+
+        public virtual ICollection<PhieuMuon> PhieuMuons { get; set; } = new List<PhieuMuon>();
+    }
 }
