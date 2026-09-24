@@ -52,7 +52,7 @@ namespace ClassHub_API.Controllers
                         && (c.MaPhongNavigation.trang_thai == "BAO_TRI"
                             || c.MaPhongNavigation.trang_thai == "TAM_KHOA")));
 
-            DateTime chartStartDate = today.AddDays(-5);
+            DateTime chartStartDate = today.AddDays(-6);
 
             var chartBorrowingDates = await _context.phieu_muon
                 .AsNoTracking()
@@ -67,7 +67,7 @@ namespace ClassHub_API.Controllers
             var chartSeries = new List<int>();
             var chartCategories = new List<string>();
 
-            for (int dayOffset = 0; dayOffset < 6; dayOffset++)
+            for (int dayOffset = 0; dayOffset < 7; dayOffset++)
             {
                 DateTime targetDate = chartStartDate.AddDays(dayOffset);
 
