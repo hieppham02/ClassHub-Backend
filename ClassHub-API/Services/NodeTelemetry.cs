@@ -4,8 +4,10 @@ using Microsoft.EntityFrameworkCore;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 namespace ClassHub_API.Services;
-public record SensorReading(string Metric, string Unit, double? Value, string Quality);
+public record SensorReading(string Metric, string Unit, double? Value, string Quality, string? UsageContext = null);
+public record DemoUsage(string? Context);
 public class NodeMessage {
+ public DemoUsage? Demo {get;set;}
  public int SchemaVersion {get;set;}
  public string? Source {get;set;}
  public string? NodeCode {get;set;}
@@ -41,8 +43,11 @@ public static class NodeTelemetry {
     var node=await db.IotNodes.FromSqlInterpolated($"SELECT * FROM iot_node WHERE node_code={p.NodeCode} FOR UPDATE").FirstOrDefaultAsync();
     if(node==null || !SourceMatches(node.DataSource,p.Source) || node.Status=="DISABLED" || node.RoomId!=p.RoomId || p.BootSequence<node.BootSequence
         || p.BootSequence==node.BootSequence && (p.BootId!=node.LastBootId || p.Sequence<=node.LastSequence)) return false;
+    // Only synthetic nodes may supply test context. Ignore scenario labels and appliance switches.
+    var usage=p.Source=="MOCK" && p.Demo?.Context is ("IDLE" or "IN_USE" or "AFTER_USE") ? p.Demo.Context : null;
+    var stored=p.Readings!.Select(r=>r with {UsageContext=usage}).ToList();
     db.IotSensors.Add(new IotSensor {NodeId=node.Id,BootId=p.BootId!,Sequence=(ulong)p.Sequence,ReceivedAt=now,
-        MeasuredAt=p.ClockSynced?p.MeasuredAtUtc:null, ClockSynced=p.ClockSynced,DataSource=p.Source!,ReadingsJson=JsonSerializer.Serialize(p.Readings,Json)});
+        MeasuredAt=p.ClockSynced?p.MeasuredAtUtc:null, ClockSynced=p.ClockSynced,DataSource=p.Source!,ReadingsJson=JsonSerializer.Serialize(stored,Json)});
     node.BootSequence=p.BootSequence;node.LastBootId=p.BootId;node.LastSequence=p.Sequence;node.LastSeenAt=now;node.Status="ONLINE";
     await db.SaveChangesAsync();await tx.CommitAsync();return true;
  }
