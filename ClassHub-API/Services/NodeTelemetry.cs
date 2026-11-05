@@ -19,7 +19,8 @@ public class NodeMessage {
 }
 public static class NodeTelemetry {
  public static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy=JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive=true };
- public static bool Valid(NodeMessage p, DateTime now) => p.SchemaVersion==1 && p.Source=="REAL" && p.NodeCode!=null
+ public static bool SourceMatches(string expected,string? actual) => actual is ("REAL" or "MOCK") && expected==actual;
+ public static bool Valid(NodeMessage p, DateTime now) => p.SchemaVersion==1 && p.Source is ("REAL" or "MOCK") && p.NodeCode!=null
     && Regex.IsMatch(p.NodeCode,@"\A[A-Za-z0-9_-]{1,50}\z") && Guid.TryParseExact(p.BootId,"D",out _)
     && p.BootSequence is >0 and <=uint.MaxValue && p.Sequence is >0 and <=uint.MaxValue
     && (!p.ClockSynced || p.MeasuredAtUtc?.Kind==DateTimeKind.Utc && p.MeasuredAtUtc>=now.AddMinutes(-5) && p.MeasuredAtUtc<=now.AddSeconds(30))
@@ -38,10 +39,10 @@ public static class NodeTelemetry {
     if(p==null || !Valid(p,now) || topic!=$"iot/node/{p.NodeCode}/telemetry") return false;
     await using var tx=await db.Database.BeginTransactionAsync();
     var node=await db.IotNodes.FromSqlInterpolated($"SELECT * FROM iot_node WHERE node_code={p.NodeCode} FOR UPDATE").FirstOrDefaultAsync();
-    if(node==null || node.DataSource!="REAL" || node.Status=="DISABLED" || node.RoomId!=p.RoomId || p.BootSequence<node.BootSequence
+    if(node==null || !SourceMatches(node.DataSource,p.Source) || node.Status=="DISABLED" || node.RoomId!=p.RoomId || p.BootSequence<node.BootSequence
         || p.BootSequence==node.BootSequence && (p.BootId!=node.LastBootId || p.Sequence<=node.LastSequence)) return false;
     db.IotSensors.Add(new IotSensor {NodeId=node.Id,BootId=p.BootId!,Sequence=(ulong)p.Sequence,ReceivedAt=now,
-        MeasuredAt=p.ClockSynced?p.MeasuredAtUtc:null, ClockSynced=p.ClockSynced,DataSource="REAL",ReadingsJson=JsonSerializer.Serialize(p.Readings,Json)});
+        MeasuredAt=p.ClockSynced?p.MeasuredAtUtc:null, ClockSynced=p.ClockSynced,DataSource=p.Source!,ReadingsJson=JsonSerializer.Serialize(p.Readings,Json)});
     node.BootSequence=p.BootSequence;node.LastBootId=p.BootId;node.LastSequence=p.Sequence;node.LastSeenAt=now;node.Status="ONLINE";
     await db.SaveChangesAsync();await tx.CommitAsync();return true;
  }

@@ -32,26 +32,35 @@ public class AssetsController(AppDbContext context, IConfiguration configuration
         return Ok(new { rooms, catalogs, equipment=equipment.Select(Item), nodes=nodes.Select(n=> {
             var measurement=latest.FirstOrDefault(s=>s.NodeId==n.Id);
             var last=n.LastSeenAt ?? measurement?.ReceivedAt;
-            // Explicit demo connectivity is stored separately from actual measurement freshness.
-            bool online=n.Status=="ONLINE" && (n.DataSource=="MOCK" || (last.HasValue
-                && (now-DateTime.SpecifyKind(last.Value,DateTimeKind.Utc)).TotalSeconds<=Math.Max(90,n.PublishIntervalSeconds*3)));
+            // MQTT test nodes expire like physical nodes; historical mock samples cannot imply live connectivity.
+            bool online=n.Status=="ONLINE" && last.HasValue
+                && (now-DateTime.SpecifyKind(last.Value,DateTimeKind.Utc)).TotalSeconds<=Math.Max(90,n.PublishIntervalSeconds*3);
             return new { n.Id, n.NodeCode, n.RoomId, n.Name, n.DataSource, status=n.Status=="DISABLED"?"DISABLED":online?"ONLINE":"OFFLINE", lastSeenAt=last,
-                n.PublishIntervalSeconds, readings=Readings(measurement?.ReadingsJson) };
+                n.PublishIntervalSeconds, n.BootSequence, n.LastBootId, n.LastSequence, readings=Readings(measurement?.ReadingsJson) };
         }) });
     }
 
     public record RegisterNodeRequest(string NodeCode,string RoomId,string Name,int PublishIntervalSeconds);
     [HttpPost("nodes")]
-    public async Task<IActionResult> RegisterNode(RegisterNodeRequest request) {
+    public Task<IActionResult> RegisterNode(RegisterNodeRequest request) => RegisterNodeSource(request,"REAL");
+
+    [HttpPost("testing-nodes")]
+    public Task<IActionResult> RegisterTestingNode(RegisterNodeRequest request) {
+        if(request.NodeCode==null || !request.NodeCode.StartsWith("DEMO_",StringComparison.Ordinal))
+            return BadRequestTask("Node thử nghiệm phải có mã DEMO_.");
+        return RegisterNodeSource(request,"MOCK");
+    }
+    Task<IActionResult> BadRequestTask(string message)=>Task.FromResult<IActionResult>(BadRequest(new {message}));
+    async Task<IActionResult> RegisterNodeSource(RegisterNodeRequest request,string source) {
         if(request.NodeCode==null || !System.Text.RegularExpressions.Regex.IsMatch(request.NodeCode,@"\A[A-Za-z0-9_-]{1,50}\z")
             || string.IsNullOrWhiteSpace(request.Name) || request.Name.Trim().Length>100 || request.PublishIntervalSeconds is <1 or >1200
             || !await context.phong_hoc.AnyAsync(r=>r.ma_phong==request.RoomId)) return BadRequest(new{message="Mã node, phòng, tên hoặc chu kỳ gửi không hợp lệ."});
         await using var tx=await context.Database.BeginTransactionAsync();
         if(await context.IotNodes.AnyAsync(n=>n.NodeCode==request.NodeCode))return Conflict(new{message="Mã node đã được đăng ký."});
-        var node=new IotNode{NodeCode=request.NodeCode,RoomId=request.RoomId,Name=request.Name.Trim(),DataSource="REAL",Status="OFFLINE",PublishIntervalSeconds=request.PublishIntervalSeconds};
+        var node=new IotNode{NodeCode=request.NodeCode,RoomId=request.RoomId,Name=request.Name.Trim(),DataSource=source,Status="OFFLINE",PublishIntervalSeconds=request.PublishIntervalSeconds};
         context.IotNodes.Add(node);
         context.nhat_ky_he_thong.Add(new NhatKyHeThong{ma_sv=User.FindFirstValue(ClaimTypes.NameIdentifier),hanh_dong="NODE_REGISTER",thoi_gian=DateTime.Now,
-            chi_tiet=JsonSerializer.Serialize(new{node.NodeCode,node.RoomId,node.PublishIntervalSeconds,source="REAL"}),user_agent="ClassHub Nodes"});
+            chi_tiet=JsonSerializer.Serialize(new{node.NodeCode,node.RoomId,node.PublishIntervalSeconds,source}),user_agent="ClassHub Nodes"});
         try{await context.SaveChangesAsync();await tx.CommitAsync();return Ok(new{node.Id,node.NodeCode,node.RoomId,node.DataSource,node.Status});}
         catch(DbUpdateException){return Conflict(new{message="Không lưu được node; kiểm tra mã trùng và tải lại."});}
     }
@@ -65,7 +74,7 @@ public class AssetsController(AppDbContext context, IConfiguration configuration
         if(node==null) return NotFound();
         var before=node.Status;
         node.Status=request.Status=="DISABLED"?"DISABLED":"OFFLINE";
-        if(request.Status=="ACTIVE" && node.DataSource!="MOCK" && node.LastSeenAt.HasValue
+        if(request.Status=="ACTIVE" && node.LastSeenAt.HasValue
             && (DateTime.UtcNow-node.LastSeenAt.Value).TotalSeconds<=Math.Max(90,node.PublishIntervalSeconds*3)) node.Status="ONLINE";
         context.nhat_ky_he_thong.Add(new NhatKyHeThong {ma_sv=User.FindFirstValue(ClaimTypes.NameIdentifier),hanh_dong="NODE_STATUS",
             chi_tiet=JsonSerializer.Serialize(new {nodeId=id,roomId=node.RoomId,before,after=node.Status}),thoi_gian=DateTime.Now,user_agent="ClassHub Nodes"});
