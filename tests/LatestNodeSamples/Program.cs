@@ -1,0 +1,23 @@
+using ClassHub_API.Services;
+using ClassHub_API.Models;
+using ClassHub_API.Data;
+using Microsoft.EntityFrameworkCore;
+var now=DateTime.UtcNow;
+IotSensor Sample(long id,int node,int age,string source="MOCK")=>new(){Id=id,NodeId=node,DataSource=source,ReceivedAt=now.AddSeconds(-age)};
+int checks=0;
+void Check(bool pass,string name){if(!pass)throw new Exception(name);checks++;Console.WriteLine("PASS "+name);}
+var rows=new[]{Sample(1,1,20),Sample(99,1,30),Sample(2,1,10),Sample(3,1,10),Sample(4,2,40),Sample(5,1,0,"REAL")};
+var actual=LatestNodeSamples.Query(rows.AsQueryable()).OrderBy(s=>s.Id).Select(s=>s.Id).ToArray();
+Check(actual.SequenceEqual(new long[]{3,4,5}),"Latest timestamp, Id tie-break, independent node and source");
+Check(!LatestNodeSamples.Query(Array.Empty<IotSensor>().AsQueryable()).Any(),"No telemetry remains empty");
+var random=new Random(42);
+var bulk=Enumerable.Range(1,100000).Select(i=>Sample(i,i%178,random.Next(10000),i%3==0?"REAL":"MOCK")).ToList();
+var expected=bulk.GroupBy(s=>(s.NodeId,s.DataSource)).Select(g=>g.OrderByDescending(s=>s.ReceivedAt).ThenByDescending(s=>s.Id).First().Id).Order().ToArray();
+var got=LatestNodeSamples.Query(bulk.AsQueryable()).Select(s=>s.Id).Order().ToArray();
+Check(got.SequenceEqual(expected),"100,000 samples / 178 nodes match previous ordering semantics");
+var options=new DbContextOptionsBuilder<AppDbContext>().UseMySql("Server=localhost;Database=translation_only;User=test;Password=test",new MySqlServerVersion(new Version(8,4,0))).Options;
+using var db=new AppDbContext(options);
+var sql=LatestNodeSamples.Query(db.IotSensors.AsNoTracking()).Select(s=>new{s.NodeId,s.DataSource,s.ReceivedAt,s.ReadingsJson}).ToQueryString();
+Check(sql.Contains("GROUP BY") && sql.Contains("MAX(") && sql.Contains("INNER JOIN"),"Pomelo translates aggregates and joins to MySQL SQL");
+Check(!sql.Contains("LIMIT") && !sql.Contains("ORDER BY"),"No repeated correlated sort/LIMIT");
+Console.WriteLine($"PASS {checks} checks; no database opened.");

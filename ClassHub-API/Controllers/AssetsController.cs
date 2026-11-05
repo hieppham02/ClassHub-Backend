@@ -26,11 +26,14 @@ public class AssetsController(AppDbContext context, IConfiguration configuration
                 building=r.MaToaNhaNavigation!=null?r.MaToaNhaNavigation.ten_toa_nha:r.ma_toa_nha, floor=r.tang }).ToListAsync();
         var equipment = await context.thiet_bi.AsNoTracking().Where(e=>e.so_luong>0).OrderBy(e=>e.ten_thiet_bi).ThenBy(e=>e.id).ToListAsync();
         var nodes = await context.IotNodes.AsNoTracking().OrderBy(n=>n.RoomId).ToListAsync();
-        var latest = await context.IotSensors.AsNoTracking().Where(s=>s.Id==context.IotSensors.Where(t=>t.NodeId==s.NodeId).OrderByDescending(t=>t.ReceivedAt).ThenByDescending(t=>t.Id).Select(t=>t.Id).FirstOrDefault()).Select(s=>new {s.NodeId,s.ReceivedAt,s.ReadingsJson}).ToListAsync();
+        // Aggregate once per node/source instead of sorting history once per sensor row.
+        var latestRows = await LatestNodeSamples.Query(context.IotSensors.AsNoTracking())
+            .Select(s=>new {s.NodeId,s.DataSource,s.ReceivedAt,s.ReadingsJson}).ToListAsync();
+        var latest=latestRows.ToDictionary(s=>(s.NodeId,s.DataSource));
         var now=DateTime.UtcNow;
         var catalogs=await context.EquipmentCatalogs.AsNoTracking().OrderBy(c=>c.Name).ToListAsync();
         return Ok(new { rooms, catalogs, equipment=equipment.Select(Item), nodes=nodes.Select(n=> {
-            var measurement=latest.FirstOrDefault(s=>s.NodeId==n.Id);
+            latest.TryGetValue((n.Id,n.DataSource),out var measurement);
             var last=n.LastSeenAt ?? measurement?.ReceivedAt;
             // MQTT test nodes expire like physical nodes; historical mock samples cannot imply live connectivity.
             bool online=n.Status=="ONLINE" && last.HasValue
