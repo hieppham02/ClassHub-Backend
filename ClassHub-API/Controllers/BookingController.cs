@@ -185,16 +185,7 @@ namespace ClassHub_API.Controllers
                 return StatusCode(StatusCodes.Status500InternalServerError, new { message = "Không thể tạo phiên mượn." });
             }
 
-            bool qrDelivered = true;
-            try
-            {
-                await _qrFlow.Issue(newBorrowingSession.id, currentUserId, "RECEIVE");
-            }
-            catch (Exception ex)
-            {
-                qrDelivered = false;
-                _logger.LogError(ex, "Phiếu {SessionId} đã được tạo nhưng không gửi được QR tới tủ.", newBorrowingSession.id);
-            }
+            bool qrDelivered = false; // User selects the equipment before issuing the pickup QR.
 
             try
             {
@@ -214,9 +205,7 @@ namespace ClassHub_API.Controllers
                 _logger.LogWarning(ex, "Không gửi được SignalR sau khi tạo phiếu {SessionId}.", newBorrowingSession.id);
             }
 
-            string message = qrDelivered
-                ? "Đăng ký mượn thiết bị thành công. Quét QR trên màn hình tủ để nhận đồ."
-                : "Đã tạo phiếu nhưng chưa gửi được QR tới tủ. Hãy cấp lại QR.";
+            string message = "Đăng ký thành công. Chọn món cần mượn trên web rồi tạo QR nhận đồ.";
 
             return StatusCode(StatusCodes.Status201Created, new
             {

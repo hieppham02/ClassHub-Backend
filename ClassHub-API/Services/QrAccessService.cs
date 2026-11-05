@@ -45,7 +45,7 @@ public partial class QrAccessService(AppDbContext db, IMqttService mqtt, IHubCon
         if (!returning && await AllocationPolicy.IsBlocked(db, session.ma_phong)) Fail(409, "Tủ đang bị chặn cấp phát do sự cố chưa được gỡ chặn.");
         if (cabinet.trang_thai_khoa == "ERROR") Fail(409, "Tủ đang gặp lỗi hoặc bảo trì.");
         if (await db.phieu_muon.AnyAsync(s => s.id != session.id && s.ma_phong == session.ma_phong &&
-            (s.trang_thai == "ACTIVE" || s.trang_thai == "IN_USE" || s.trang_thai == "RETURNING" || s.QrPhase == "RECEIVE_OPEN_REQUESTED" || s.QrPhase == "RECEIVE_OPEN")))
+            (s.trang_thai == "ACTIVE" || s.trang_thai == "IN_USE" || s.trang_thai == "RETURNING" || s.QrPhase == "RECEIVE_OPEN_REQUESTED" || s.QrPhase == "RECEIVE_OPEN" || s.QrPhase == "RECEIVE_RFID_FAILED")))
             Fail(409, "Tủ đang có lượt mượn chưa trả. Chờ lượt trước hoàn tất.");
         return cabinet;
     }
@@ -54,7 +54,7 @@ public partial class QrAccessService(AppDbContext db, IMqttService mqtt, IHubCon
             chi_tiet = JsonSerializer.Serialize(new { sessionId = session.id, roomId = session.ma_phong, detail }),
             thoi_gian = DateTime.Now, user_agent = "ClassHub QR" });
 
-    public async Task<object> Issue(int id, string userId, string purpose)
+    public async Task<object> Issue(int id, string userId, string purpose, string[]? selectedUids = null)
     {
         if (purpose is not ("RECEIVE" or "RETURN")) Fail(400, "Thao tác QR không hợp lệ.");
         await using var tx = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.ReadCommitted);
@@ -67,13 +67,16 @@ public partial class QrAccessService(AppDbContext db, IMqttService mqtt, IHubCon
         var previous = await db.QrAccesses.Where(q => q.SessionId == id && q.State != "REVOKED").ToListAsync();
         if (previous.Any(q => q.State == "USED" || q.State == "OPENED")) Fail(409, "Đang chờ tủ phản hồi lệnh trước. Không cấp mã mới.");
         foreach (var q in previous) q.State = "REVOKED";
-        if (purpose == "RECEIVE" && !await db.phieu_muon_thiet_bi.AnyAsync(e => e.phieu_muon_id == id))
-        {
-            var equipment = await db.thiet_bi.Where(e => e.ma_phong == session.ma_phong && e.UsageScope == "CABINET" && e.so_luong > 0).ToListAsync();
-            foreach (var e in equipment) db.phieu_muon_thiet_bi.Add(new PhieuMuonThietBi { phieu_muon_id = id, thiet_bi_id = e.id, ten_thiet_bi = e.ten_thiet_bi, so_luong = e.so_luong, tinh_trang_du_kien = e.tinh_trang });
+        string? selection = null;
+        if(purpose=="RECEIVE") {
+            if(selectedUids==null) {
+                var prior=previous.OrderByDescending(q=>q.Id).FirstOrDefault(q=>q.Purpose=="RECEIVE")?.RfidExpectedJson;
+                if(prior!=null)try {selectedUids=JsonSerializer.Deserialize<List<RfidExpectedItem>>(prior)?.SelectMany(e=>e.Uids).ToArray();}catch(JsonException){}
+            }
+            selection=await SelectEquipment(session,selectedUids);
         }
         var token = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
-        var qr = new QrAccess { SessionId = id, TokenHash = Hash(token), Purpose = purpose, ExpiresAt = DateTime.UtcNow.AddMinutes(3) };
+        var qr = new QrAccess { SessionId = id, TokenHash = Hash(token), Purpose = purpose, RfidExpectedJson = selection, ExpiresAt = DateTime.UtcNow.AddMinutes(3) };
         db.QrAccesses.Add(qr);
         if (purpose == "RETURN") { session.trang_thai = "RETURNING"; session.ma_sv_tra = userId; }
         session.QrPhase = purpose + "_QR";
@@ -137,7 +140,13 @@ public partial class QrAccessService(AppDbContext db, IMqttService mqtt, IHubCon
         var receiveSnapshot = purpose == "RETURN" ? await db.QrAccesses.AsNoTracking()
             .Where(q => q.SessionId == id && q.Purpose == "RECEIVE" && q.RfidExpectedJson != null)
             .OrderByDescending(q => q.Id).Select(q => q.RfidExpectedJson).FirstOrDefaultAsync() : null;
-        qr.RfidExpectedJson = receiveSnapshot ?? await RfidSession.Snapshot(db, id);
+        qr.RfidExpectedJson = receiveSnapshot ?? qr.RfidExpectedJson;
+        if(qr.RfidExpectedJson==null || RfidSession.Summarize(qr.RfidExpectedJson,"[]").Status=="UNCONFIGURED")
+            Fail(409,"Chọn thiết bị và tạo lại QR nhận đồ trước khi mở tủ.");
+        if(purpose=="RECEIVE") {
+            var chosen=JsonSerializer.Deserialize<List<RfidExpectedItem>>(qr.RfidExpectedJson!)?.SelectMany(e=>e.Uids).ToArray();
+            if(!RfidSelectionRules.Valid(chosen,await Available(session)))Fail(409,"Thiết bị hoặc thẻ trong tủ đã thay đổi. Chọn lại món và tạo QR mới.");
+        }
         qr.RfidObservedJson = null; qr.RfidSequence = 0; qr.RfidPassed = null;
         qr.State = "USED"; qr.UsedAt = DateTime.UtcNow; qr.CommandId = Guid.NewGuid().ToString("N");
         if (purpose == "RETURN") session.ma_sv_tra = userId;
@@ -195,7 +204,11 @@ public partial class QrAccessService(AppDbContext db, IMqttService mqtt, IHubCon
                 session.QrPhase = qr.Purpose + "_OPEN"; break;
             case "CLOSED" when qr.State == "OPENED" || (!RequireReturnVerification && qr.Purpose == "RETURN" && qr.State == "CLOSED"):
                 qr.State = "CLOSED"; session.is_cabinet_open = false; if (cabinet.trang_thai_khoa != "ERROR") cabinet.trang_thai_khoa = "LOCKED";
-                if (qr.Purpose == "RECEIVE") { session.trang_thai = "IN_USE"; session.thoi_gian_nhan ??= DateTime.Now; session.QrPhase = "IN_USE"; }
+                if (qr.Purpose == "RECEIVE") {
+                    var received=RfidSelectionRules.Received(qr.RfidExpectedJson,qr.RfidObservedJson);
+                    session.trang_thai=received?"IN_USE":"PENDING";session.QrPhase=received?"IN_USE":"RECEIVE_RFID_FAILED";
+                    if(received)session.thoi_gian_nhan??=DateTime.Now;
+                }
                 else session.QrPhase = "RETURN_CHECK";
                 break;
             case "RFID_SCAN" when qr.State is "USED" or "OPENED" or "CLOSED":
@@ -213,6 +226,11 @@ public partial class QrAccessService(AppDbContext db, IMqttService mqtt, IHubCon
                 if (result.Sequence <= qr.VerificationSequence || !result.RfidPassed.HasValue || !result.CameraPassed.HasValue) return;
                 qr.VerificationSequence = result.Sequence; qr.CameraPassed = result.CameraPassed; break;
             default: return;
+        }
+        if(qr.Purpose=="RECEIVE" && qr.State=="CLOSED") {
+            var received=RfidSelectionRules.Received(qr.RfidExpectedJson,qr.RfidObservedJson);
+            session.trang_thai=received?"IN_USE":"PENDING";session.QrPhase=received?"IN_USE":"RECEIVE_RFID_FAILED";
+            if(received)session.thoi_gian_nhan??=DateTime.Now;
         }
         if (qr.Purpose == "RETURN" && qr.State == "CLOSED") {
             session.QrPhase = qr.RfidPassed == false || qr.CameraPassed == false || session.tinh_trang_tra == "MAT_DO"

@@ -1,0 +1,24 @@
+using ClassHub_API.Services;
+using System.Text.Json;
+var count=0;
+void Check(bool ok,string name){if(!ok)throw new Exception(name);count++;Console.WriteLine("PASS: "+name);}
+SelectableRfidItem[] available=[new(1,"Mic 1","11223344","TOT"),new(1,"Mic 2","AABBCCDD","TOT"),new(2,"Remote","12345678","TOT"),new(3,"Key","87654321","TOT")];
+Check(RfidSelectionRules.Valid(["11223344"],available),"One mic may be selected without all cabinet contents");
+Check(RfidSelectionRules.Valid(["11223344","12345678"],available),"Mic and remote form a partial selection");
+Check(!RfidSelectionRules.Valid([],available),"Empty pickup selection rejected");
+Check(!RfidSelectionRules.Valid(null,available),"Unselected pickup never defaults to whole cabinet");
+Check(!RfidSelectionRules.Valid(["11223344","11223344"],available),"Duplicate card cannot add two items");
+Check(!RfidSelectionRules.Valid(["DEADBEEF"],available),"Card from another cabinet rejected");
+Check(!RfidSelectionRules.Valid(["bad"],available),"Malformed UID rejected");
+var expected=JsonSerializer.Serialize(new[]{new RfidExpectedItem(7,1,"Mic",1,["11223344"]),new RfidExpectedItem(8,2,"Remote",1,["12345678"])});
+Check(!RfidSelectionRules.Received(expected,null),"Closing pickup without RFID cannot complete it");
+Check(!RfidSelectionRules.Received(expected,"[]"),"Empty scan cannot complete pickup");
+Check(!RfidSelectionRules.Received(expected,"[\"11223344\"]"),"One missing selected item blocks completion");
+Check(!RfidSelectionRules.Received(expected,"[\"11223344\",\"87654321\"]"),"Another cabinet item cannot replace selected remote");
+Check(!RfidSelectionRules.Received(expected,"[\"11223344\",\"12345678\",\"87654321\"]"),"Unexpected extra card blocks comparison");
+Check(RfidSelectionRules.Received(expected,"[\"11223344\",\"12345678\"]"),"Exactly selected cards pass pickup and return");
+Check(RfidSelectionRules.Received(expected,"[\"12345678\",\"11223344\"]"),"Scan order does not matter");
+Check(!RfidSelectionRules.Received(null,"[\"11223344\"]"),"Missing snapshot cannot complete pickup");
+var partiallyConfigured=JsonSerializer.Serialize(new[]{new RfidExpectedItem(1,1,"Mic",2,["11223344"])});
+Check(!RfidSelectionRules.Received(partiallyConfigured,"[\"11223344\"]"),"Quantity must match individually selected cards");
+Console.WriteLine($"PASS: {count} selective pickup checks; no database opened");

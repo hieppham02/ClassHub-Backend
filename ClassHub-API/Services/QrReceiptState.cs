@@ -54,7 +54,11 @@ public partial class QrAccessService
                             session.is_cabinet_open = true; if (cabinet.trang_thai_khoa != "ERROR") cabinet.trang_thai_khoa = "UNLOCKED"; break;
                         case "CLOSED":
                             qr.State = "CLOSED"; session.is_cabinet_open = false; if (cabinet.trang_thai_khoa != "ERROR") cabinet.trang_thai_khoa = "LOCKED";
-                            if (qr.Purpose == "RECEIVE") { session.trang_thai = "IN_USE"; session.QrPhase = "IN_USE"; session.thoi_gian_nhan ??= DateTime.Now; }
+                            if (qr.Purpose == "RECEIVE") {
+                                var received=RfidSelectionRules.Received(qr.RfidExpectedJson,qr.RfidObservedJson);
+                                session.trang_thai=received?"IN_USE":"PENDING";session.QrPhase=received?"IN_USE":"RECEIVE_RFID_FAILED";
+                                if(received)session.thoi_gian_nhan??=DateTime.Now;
+                            }
                             else { session.trang_thai = "RETURNING"; session.QrPhase = rfid == "WRONG" || session.tinh_trang_tra == "MAT_DO" ? "RETURN_FAILED" : "RETURN_CHECK"; }
                             break;
                         case "FAILED":

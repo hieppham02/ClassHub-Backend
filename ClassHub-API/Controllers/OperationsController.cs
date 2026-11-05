@@ -112,6 +112,8 @@ public class OperationsController(AppDbContext context, IHubContext<CabinetHub> 
         var qr = await context.QrAccesses.OrderByDescending(q => q.Id).FirstOrDefaultAsync(q => q.SessionId == id);
         if (session.QrEnabled && (qr?.Purpose != "RETURN" || qr.State != "CLOSED" || session.is_cabinet_open == true))
             return Conflict(new { message = "Chờ tủ xác nhận đã mở rồi đóng cửa của đúng phiên trả." });
+        if(!RfidSelectionRules.Received(qr?.RfidExpectedJson,qr?.RfidObservedJson))
+            return Conflict(new { message = "Chưa quét đủ RFID của các món đã mượn. Nếu kiểm tra trực tiếp, dùng Xác nhận trả đồ thủ công." });
         var command = qr?.CommandId;
         var inspection = await context.ReturnInspections.OrderByDescending(i => i.Id).FirstOrDefaultAsync(i =>
             i.SessionId == id && i.CommandId == command);
