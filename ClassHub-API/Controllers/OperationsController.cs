@@ -18,6 +18,13 @@ public class EquipmentUpdate
     [MaxLength(255)] public string? Note { get; set; }
 }
 
+public class ManualReturnReport
+{
+    public bool Acknowledged { get; set; }
+    [Required] public string Condition { get; set; } = "BINH_THUONG";
+    [MaxLength(2000)] public string? Note { get; set; }
+}
+
 public class ReturnReport
 {
     public int? InspectionId { get; set; }
@@ -151,6 +158,52 @@ public class OperationsController(AppDbContext context, IHubContext<CabinetHub> 
             status = stillBlocked ? "Bảo trì" : "Trống" });
         return Ok(new { message = request.Condition == "HONG_HOC"
             ? "Đã xác nhận trả. Tủ được chặn cấp phát để kiểm tra thiết bị hỏng." : "Đã xác nhận trả đủ thiết bị." });
+    }
+
+    [Authorize(Roles = "ADMIN")]
+    [HttpPost("sessions/{id:int}/confirm-return-manual")]
+    public async Task<IActionResult> ConfirmManual(int id, ManualReturnReport request)
+    {
+        var actor = User.FindFirstValue(ClaimTypes.NameIdentifier);
+        if (string.IsNullOrWhiteSpace(actor)) return Unauthorized();
+        if (!request.Acknowledged || request.Condition is not ("BINH_THUONG" or "HONG_HOC"))
+            return BadRequest(new { message = "Cần xác nhận đã nhận đủ thiết bị và chọn tình trạng trả." });
+        if (request.Condition == "HONG_HOC" && string.IsNullOrWhiteSpace(request.Note))
+            return BadRequest(new { message = "Ghi rõ tình trạng thiết bị hỏng." });
+        await using var tx = await context.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);
+        var session = (await context.phieu_muon.FromSqlInterpolated($"SELECT * FROM borrowing_session WHERE id={id} FOR UPDATE").ToListAsync()).FirstOrDefault();
+        if (session == null) return NotFound();
+        if (session.trang_thai == "COMPLETED") return Ok(new { message = "Phiếu đã được xác nhận trả." });
+        var cabinet = await context.thiet_bi_iot.FirstOrDefaultAsync(c => c.ma_phong == session.ma_phong);
+        var health = CabinetHealthService.View(await context.CabinetHealths.FirstOrDefaultAsync(h => h.RoomId == session.ma_phong), DateTime.UtcNow);
+        var qr = await context.QrAccesses.OrderByDescending(q => q.Id).FirstOrDefaultAsync(q => q.SessionId == id);
+        var rejection = ManualReturnRules.Validate(session.trang_thai, cabinet?.trang_thai_khoa,
+            session.is_cabinet_open, health?.Metrics.DoorOpen, qr?.Purpose, qr?.State);
+        if(rejection != null)return Conflict(new { message = rejection });
+        var previousCondition = session.tinh_trang_tra;
+        var previousNote = session.ghi_chu_tra;
+        session.trang_thai = "COMPLETED"; session.QrPhase = "COMPLETED";
+        session.tinh_trang_tra = request.Condition;
+        session.ghi_chu_tra = string.IsNullOrWhiteSpace(request.Note) ? "Admin xác nhận trả thủ công." : request.Note.Trim();
+        session.thoi_gian_tra = DateTime.Now;
+        // Invalidate an unconsumed QR; never fabricate camera/RFID results or a physical door event.
+        if (qr?.State == "ISSUED") qr.State = "REVOKED";
+        if (request.Condition == "HONG_HOC")
+            await AllocationPolicy.MarkReturnIncident(context, session, request.Condition, session.ghi_chu_tra, actor);
+        Log("XAC_NHAN_TRA_THU_CONG", System.Text.Json.JsonSerializer.Serialize(new {
+            sessionId = id, adminId = actor, bypassCamera = true, bypassRfid = true,
+            condition = request.Condition, note = session.ghi_chu_tra, previousCondition, previousNote,
+            commandId = qr?.CommandId, rfidPassed = qr?.RfidPassed, cameraPassed = qr?.CameraPassed
+        }));
+        await context.SaveChangesAsync(); await tx.CommitAsync();
+        var blocked = await AllocationPolicy.IsBlocked(context, session.ma_phong);
+        await hub.Clients.All.SendAsync("CabinetStatusChanged", new {
+            roomId = session.ma_phong, sessionId = id, isOnline = cabinet!.trang_thai_mang,
+            qrPhase = "COMPLETED", status = blocked ? "Bảo trì" : "Trống"
+        });
+        return Ok(new { message = request.Condition == "HONG_HOC"
+            ? "Đã xác nhận trả thủ công. Tủ chờ kiểm tra thiết bị hỏng."
+            : "Đã xác nhận trả đồ thủ công, bỏ qua AI camera và RFID." });
     }
 
     [HttpGet("alerts")]
