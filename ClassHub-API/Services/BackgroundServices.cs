@@ -199,7 +199,7 @@ namespace ClassHub_API.Services
 
                 string displayStatus;
 
-                if (await AllocationPolicy.IsBlocked(dbContext, roomId) || !incomingOnline || lockStatus == "ERROR" || cabinet?.MaPhongNavigation?.trang_thai is "BAO_TRI" or "TAM_KHOA")
+                if (await AllocationPolicy.IsBlocked(dbContext, roomId) || lockStatus == "ERROR" || cabinet?.MaPhongNavigation?.trang_thai is "BAO_TRI" or "TAM_KHOA")
                     displayStatus = "Bảo trì";
                 else if (borrowingSession?.trang_thai == "RETURNING")
                     displayStatus = "Đang xác nhận trả";
@@ -214,12 +214,15 @@ namespace ClassHub_API.Services
 
                 var healthRow = await dbContext.CabinetHealths.FindAsync(roomId);
                 var health = CabinetHealthService.View(healthRow, DateTime.UtcNow);
-                var measuredDoor = data.doorOpen ?? health?.Metrics.DoorOpen;
+                var rememberedDoors = await CabinetDisplay.LastDoors(dbContext, [roomId]);
+                var measuredDoor = CabinetDisplay.DoorOpen(data.doorOpen ?? health?.Metrics.DoorOpen,
+                    rememberedDoors.TryGetValue(roomId,out var rememberedDoor)?rememberedDoor:null);
                 await _hubContext.Clients.All.SendAsync("CabinetStatusChanged", new
                 {
                     roomId, health,
-                    isOpen = measuredDoor ?? (lockStatus == "UNLOCKED"),
-                    doorCondition = measuredDoor.HasValue ? measuredDoor.Value ? "Mở" : "Đóng" : "Chưa có dữ liệu cảm biến",
+                    isOpen = measuredDoor,
+                    isDoorOpen = measuredDoor,
+                    doorCondition = CabinetDisplay.DoorLabel(measuredDoor),
                     isOnline = cabinet?.trang_thai_mang ?? incomingOnline,
                     lockStatus,
                     status = displayStatus,
@@ -253,6 +256,7 @@ namespace ClassHub_API.Services
                 DateTime now = DateTime.Now;
 
                 var timedOutCabinets = await dbContext.thiet_bi_iot
+                    .Include(c=>c.MaPhongNavigation)
                     .Where(c => c.trang_thai_mang
                         && (!c.lan_cuoi_online.HasValue
                             || EF.Functions.DateDiffSecond(c.lan_cuoi_online.Value, now) > 30))
@@ -268,16 +272,31 @@ namespace ClassHub_API.Services
 
                 await dbContext.SaveChangesAsync();
 
+                var rooms = timedOutCabinets.Select(c=>c.ma_phong).OfType<string>().ToArray();
+                var rememberedDoors = await CabinetDisplay.LastDoors(dbContext, rooms);
+                var healthRows = rooms.Length==0 ? new Dictionary<string,CabinetHealth>() :
+                    await dbContext.CabinetHealths.AsNoTracking().Where(h=>rooms.Contains(h.RoomId)).ToDictionaryAsync(h=>h.RoomId);
+                var bookings = rooms.Length==0 ? new List<PhieuMuon>() :
+                    await dbContext.phieu_muon.AsNoTracking().Where(s=>rooms.Contains(s.ma_phong) && ActiveStatuses.Contains(s.trang_thai))
+                    .OrderByDescending(s=>s.thoi_gian_tao).ToListAsync();
+                var blockedRooms = await AllocationPolicy.BlockedRooms(dbContext);
                 foreach (var cabinet in timedOutCabinets)
                 {
+                    var room = cabinet.ma_phong ?? "";
+                    healthRows.TryGetValue(room,out var healthRow);
+                    var health = CabinetHealthService.View(healthRow,DateTime.UtcNow);
+                    bool doorOpen = CabinetDisplay.DoorOpen(health?.Metrics.DoorOpen,
+                        rememberedDoors.TryGetValue(room,out var rememberedDoor)?rememberedDoor:null);
+                    var booking = bookings.FirstOrDefault(s=>s.ma_phong==room);
                     await _hubContext.Clients.All.SendAsync("CabinetStatusChanged", new
                     {
                         roomId = cabinet.ma_phong,
-                        isOpen = cabinet.trang_thai_khoa == "UNLOCKED",
-                        doorCondition = cabinet.trang_thai_khoa == "UNLOCKED" ? "Mở" : "Đóng",
+                        isOpen = doorOpen,
+                        isDoorOpen = doorOpen,
+                        doorCondition = CabinetDisplay.DoorLabel(doorOpen),
                         isOnline = false,
                         lockStatus = cabinet.trang_thai_khoa,
-                        status = "Bảo trì",
+                        status = CabinetDisplay.Status(cabinet,cabinet.MaPhongNavigation?.trang_thai,booking,blockedRooms.Contains(room)),
                         timestamp = now.ToString("HH:mm:ss")
                     });
                 }
