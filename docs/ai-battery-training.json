@@ -1,0 +1,69 @@
+{
+  "modelVersion": "b027ce7b4f1a9a55acac",
+  "algorithm": "GradientBoostingRegressor",
+  "trainingSource": "SYNTHETIC",
+  "seed": 20261106,
+  "trainedAtUtc": "2026-11-05T21:12:33.067499+00:00",
+  "sklearnVersion": "1.9.0",
+  "sampleCount": 10738,
+  "trainRows": 7721,
+  "calibrationRows": 1483,
+  "testRows": 1534,
+  "deviceCount": 600,
+  "split": "70/15/15 by device; no shared device across splits",
+  "features": [
+    "deviceKind",
+    "ageDays",
+    "borrowHoursTotal",
+    "borrowEventsTotal",
+    "hoursLast7",
+    "activeDaysLast7",
+    "rechargeable"
+  ],
+  "metrics": {
+    "maeDays": 26.164172922011762,
+    "rmseDays": 39.732168374432774,
+    "r2": 0.822569450891428,
+    "baselineMaeDays": 42.07970837829872,
+    "microphoneMaeDays": 7.6107692361473465,
+    "remoteMaeDays": 39.33977843806039,
+    "testIntervalCoverage": 0.9217731421121251
+  },
+  "intervalAbsoluteErrorDays": [
+    22.584144687461688,
+    78.37522298601787
+  ],
+  "featureImportance": {
+    "deviceKind": 0.47685770700207214,
+    "ageDays": 0.05958275636193622,
+    "borrowHoursTotal": 0.39753215654467533,
+    "borrowEventsTotal": 0.022771601754026045,
+    "hoursLast7": 0.03240999758914551,
+    "activeDaysLast7": 0.00603245594177582,
+    "rechargeable": 0.0048133248063688665
+  },
+  "realBatteryCycles": 0,
+  "limitation": "Experimental model trained on generated cycles; not validated on real battery failures.",
+  "calendarBaselineDays": [
+    30.619508262797257,
+    240.1908396946565
+  ],
+  "featureMinimum": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "featureMaximum": [
+    1.0,
+    523.0,
+    876.3752823439269,
+    1089.0,
+    51.23427429516928,
+    7.0,
+    1.0
+  ]
+}

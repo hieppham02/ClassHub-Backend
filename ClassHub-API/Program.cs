@@ -117,6 +117,7 @@ namespace ClassHub_API
             builder.Services.AddScoped<ReturnInspectionService>();
             builder.Services.AddScoped<BatteryAssessmentService>();
             builder.Services.AddSingleton<RfidEnrollmentTokens>();
+            builder.Services.AddSingleton<BatteryForecastModel>();
             builder.Services.AddHostedService<ReturnInspectionWorker>();
             builder.Services.AddHostedService<OperationRulesWorker>();
             builder.Services.AddAuthorization();
