@@ -1,4 +1,4 @@
-﻿using ClassHub_API.Data;
+using ClassHub_API.Data;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -55,17 +55,21 @@ namespace ClassHub_API.Controllers
                     floor = $"Tầng {room.tang}",
                     floorNum = room.tang,
                     name = room.ten_phong,
+                    locationType = room.LocationType,
                     capacity = room.suc_chua ?? 0,
                     status = isAvailable ? "AVAILABLE" : "MAINTENANCE",
                     roomStatus = room.trang_thai,
                     hasCabinet,
                     isOnline,
                     lockStatus = cabinet?.trang_thai_khoa,
-                    equipment = room.ThietBis
+                    equipment = room.ThietBis.Where(e => e.UsageScope == "CABINET" && e.so_luong > 0)
                         .Select(equipment => equipment.ten_thiet_bi)
                         .Distinct()
                         .OrderBy(name => name)
                         .ToList(),
+                    equipmentDetails = room.ThietBis.Where(e => e.UsageScope == "CABINET" && e.so_luong > 0).OrderBy(e => e.id)
+                        .Select(e => new { e.id, name = e.ten_thiet_bi, quantity = e.so_luong,
+                            condition = e.tinh_trang, note = e.ghi_chu }).ToList(),
                     tone = "from-blue-600 to-cyan-500"
                 };
             });

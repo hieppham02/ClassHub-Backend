@@ -1,62 +1,62 @@
-﻿using System;
+using System;
 using System.ComponentModel.DataAnnotations;
 using System.ComponentModel.DataAnnotations.Schema;
 
 namespace ClassHub_API.Models
 {
-    [Table("phieu_muon")]
+    [Table("borrowing_session")]
     public class PhieuMuon
     {
         [Key]
         [Column("id")]
         public int id { get; set; }
 
-        [Column("ma_sv")]
+        [Column("borrower_id")]
         public string ma_sv { get; set; } = null!;
 
-        [Column("ma_phong")]
+        [Column("room_id")]
         public string ma_phong { get; set; } = null!;
 
-        [Column("ngay_muon")]
+        [Column("borrowing_date")]
         public DateTime ngay_muon { get; set; }
 
-        [Column("ca_muon")]
+        [Column("slot_id")]
         public int ca_muon { get; set; }
 
-        [Column("trang_thai")]
+        [Column("status")]
         public string trang_thai { get; set; } = "PENDING";
 
-        [Column("thoi_gian_tao")]
+        [Column("created_at")]
         public DateTime thoi_gian_tao { get; set; } = DateTime.Now;
 
-        [Column("otp")]
-        public string? otp { get; set; }
+        [Column("qr_enabled")]
+        public bool QrEnabled { get; set; } = true;
 
-        [Column("otp_expires_at")]
-        public DateTime? otp_expires_at { get; set; }
+        [Column("qr_phase"), MaxLength(40)]
+        public string? QrPhase { get; set; }
 
-        [Column("thoi_gian_nhan")]
+        [Column("received_at")]
         public DateTime? thoi_gian_nhan { get; set; }
 
-        [Column("thoi_gian_tra")]
+        [Column("returned_at")]
         public DateTime? thoi_gian_tra { get; set; }
 
-        [Column("ma_sv_tra")]
+        [Column("returner_id")]
         public string? ma_sv_tra { get; set; }
 
-        [Column("ma_sv_uy_quyen")]
+        [Column("delegate_id")]
         public string? ma_sv_uy_quyen { get; set; }
 
         [Column("is_cabinet_open")]
         public bool? is_cabinet_open { get; set; } = false;
 
-        [Column("tinh_trang_tra")]
+        [Column("return_condition")]
         public string? tinh_trang_tra { get; set; } = "BINH_THUONG";
 
-        [Column("ghi_chu_tra")]
+        [Column("return_note")]
         public string? ghi_chu_tra { get; set; }
 
-        [Column("ly_do_huy")]
+        [Column("cancellation_reason")]
         public string? ly_do_huy { get; set; }
 
         [ForeignKey("ma_phong")]

@@ -490,3 +490,8 @@ appsettings.Local.json
 .env
 .env.*
 ClassHub-API/appsettings.Development.json
+
+# Local preparation artifacts
+.codex-temp/
+*.pem
+*.dump

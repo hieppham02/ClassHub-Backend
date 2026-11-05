@@ -1,4 +1,4 @@
-﻿using ClassHub_API.Data;
+using ClassHub_API.Data;
 using ClassHub_API.DTOs;
 using ClassHub_API.Hubs;
 using ClassHub_API.Models;
@@ -7,11 +7,9 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
-using Newtonsoft.Json;
 using System.Data;
 using System.Globalization;
 using System.Security.Claims;
-using System.Security.Cryptography;
 
 namespace ClassHub_API.Controllers
 {
@@ -22,15 +20,15 @@ namespace ClassHub_API.Controllers
     {
         private static readonly string[] ActiveStatuses = { "PENDING", "ACTIVE", "IN_USE", "RETURNING" };
 
+        private readonly QrAccessService _qrFlow;
         private readonly AppDbContext _context;
-        private readonly IMqttService _mqttService;
         private readonly IHubContext<CabinetHub> _hubContext;
         private readonly ILogger<BookingController> _logger;
 
-        public BookingController(AppDbContext context, IMqttService mqttService, IHubContext<CabinetHub> hubContext, ILogger<BookingController> logger)
+        public BookingController(AppDbContext context, IHubContext<CabinetHub> hubContext, ILogger<BookingController> logger, QrAccessService qrFlow)
         {
+            _qrFlow = qrFlow;
             _context = context;
-            _mqttService = mqttService;
             _hubContext = hubContext;
             _logger = logger;
         }
@@ -121,10 +119,14 @@ namespace ClassHub_API.Controllers
 
             if (cabinet == null) return BadRequest(new { message = "Phòng này chưa được cấu hình tủ IoT." });
             if (!cabinet.trang_thai_mang) return BadRequest(new { message = "Tủ đang offline. Không thể tạo phiên mượn." });
+            if (await AllocationPolicy.IsBlocked(_context, room.ma_phong)) return BadRequest(new { message = "Tủ đang bị chặn cấp phát do sự cố chưa được gỡ chặn." });
             if (cabinet.trang_thai_khoa == "ERROR") return BadRequest(new { message = "Tủ đang gặp lỗi hoặc bảo trì." });
 
+            if (await _context.thiet_bi.AnyAsync(e => e.ma_phong == requestedRoomId && e.UsageScope == "CABINET"
+                && (e.tinh_trang != "TOT" || e.so_luong <= 0)))
+                return BadRequest(new { message = "Bộ thiết bị của phòng có thiết bị hỏng hoặc cần bảo trì. Vui lòng liên hệ quản trị viên." });
+
             DateTime now = DateTime.Now;
-            string newOtp = RandomNumberGenerator.GetInt32(100000, 1000000).ToString(CultureInfo.InvariantCulture);
 
             var newBorrowingSession = new PhieuMuon
             {
@@ -134,8 +136,7 @@ namespace ClassHub_API.Controllers
                 ca_muon = request.CaMuon,
                 trang_thai = "PENDING",
                 thoi_gian_tao = now,
-                otp = newOtp,
-                otp_expires_at = now.AddMinutes(3),
+                QrEnabled = true,
                 is_cabinet_open = false
             };
 
@@ -184,23 +185,15 @@ namespace ClassHub_API.Controllers
                 return StatusCode(StatusCodes.Status500InternalServerError, new { message = "Không thể tạo phiên mượn." });
             }
 
-            bool otpDelivered = true;
-            string otpTopic = $"backend/cabinet/{newBorrowingSession.ma_phong}/otp";
-            string otpPayload = JsonConvert.SerializeObject(new
-            {
-                id = newBorrowingSession.id,
-                room = newBorrowingSession.ma_phong,
-                otp = newOtp
-            });
-
+            bool qrDelivered = true;
             try
             {
-                await _mqttService.PublishAsync(otpTopic, otpPayload);
+                await _qrFlow.Issue(newBorrowingSession.id, currentUserId, "RECEIVE");
             }
             catch (Exception ex)
             {
-                otpDelivered = false;
-                _logger.LogError(ex, "Phiếu {SessionId} đã được tạo nhưng không gửi được OTP tới MQTT.", newBorrowingSession.id);
+                qrDelivered = false;
+                _logger.LogError(ex, "Phiếu {SessionId} đã được tạo nhưng không gửi được QR tới tủ.", newBorrowingSession.id);
             }
 
             try
@@ -221,130 +214,18 @@ namespace ClassHub_API.Controllers
                 _logger.LogWarning(ex, "Không gửi được SignalR sau khi tạo phiếu {SessionId}.", newBorrowingSession.id);
             }
 
-            string message = otpDelivered
-                ? "Đăng ký mượn thiết bị thành công."
-                : "Đã tạo phiên mượn nhưng HMI chưa nhận được OTP. Hãy cấp lại OTP.";
+            string message = qrDelivered
+                ? "Đăng ký mượn thiết bị thành công. Quét QR trên màn hình tủ để nhận đồ."
+                : "Đã tạo phiếu nhưng chưa gửi được QR tới tủ. Hãy cấp lại QR.";
 
             return StatusCode(StatusCodes.Status201Created, new
             {
                 message,
                 sessionId = newBorrowingSession.id,
-                otpDelivered,
-                otpExpiresAt = newBorrowingSession.otp_expires_at
+                qrEnabled = newBorrowingSession.QrEnabled,
+                qrDelivered
             });
         }
 
-        [HttpPut("return-room/{id:int}")]
-        public async Task<IActionResult> ReturnRoom(int id, [FromQuery] string room)
-        {
-            string? currentUserId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
-            if (string.IsNullOrWhiteSpace(currentUserId))
-                return Unauthorized(new { message = "Không xác định được người dùng." });
-
-            if (id <= 0 || string.IsNullOrWhiteSpace(room))
-                return BadRequest(new { message = "Thông tin phiên mượn không hợp lệ." });
-
-            string requestedRoomId = room.Trim();
-
-            var borrowingSession = await _context.phieu_muon
-                .FirstOrDefaultAsync(p => p.id == id
-                    && p.ma_phong == requestedRoomId
-                    && (p.ma_sv == currentUserId || p.ma_sv_uy_quyen == currentUserId));
-
-            if (borrowingSession == null)
-                return NotFound(new { message = "Không tìm thấy phiên mượn hoặc bạn không có quyền thao tác." });
-
-            if (borrowingSession.trang_thai == "COMPLETED" || borrowingSession.trang_thai == "CANCELED")
-                return BadRequest(new { message = "Phiên mượn đã hoàn tất hoặc đã bị hủy." });
-
-            if (!ActiveStatuses.Contains(borrowingSession.trang_thai))
-                return BadRequest(new { message = "Trạng thái phiên mượn không cho phép trả thiết bị." });
-
-            var cabinet = await _context.thiet_bi_iot
-                .AsNoTracking()
-                .FirstOrDefaultAsync(c => c.ma_phong == requestedRoomId);
-
-            if (cabinet == null) return BadRequest(new { message = "Không tìm thấy tủ IoT của phòng." });
-            if (!cabinet.trang_thai_mang) return BadRequest(new { message = "Tủ đang offline. Không thể xác nhận trả." });
-            if (cabinet.trang_thai_khoa == "ERROR") return BadRequest(new { message = "Tủ đang gặp lỗi hoặc bảo trì." });
-
-            bool isFirstReturnRequest = borrowingSession.trang_thai != "RETURNING";
-
-            if (isFirstReturnRequest)
-            {
-                borrowingSession.trang_thai = "RETURNING";
-                borrowingSession.ma_sv_tra = currentUserId;
-                borrowingSession.otp = null;
-                borrowingSession.otp_expires_at = null;
-
-                string userRole = User.FindFirst(ClaimTypes.Role)?.Value ?? "SINHVIEN";
-
-                _context.nhat_ky_he_thong.Add(new NhatKyHeThong
-                {
-                    ma_sv = currentUserId,
-                    hanh_dong = "YEU_CAU_TRA_THIET_BI",
-                    chi_tiet = $"{userRole} yêu cầu trả thiết bị phòng {requestedRoomId}.",
-                    thoi_gian = DateTime.Now,
-                    ip_address = Helper.GetClientIp(HttpContext),
-                    user_agent = Helper.GetClientOs(Request)
-                });
-
-                try
-                {
-                    await _context.SaveChangesAsync();
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Không thể chuyển phiếu {SessionId} sang RETURNING.", borrowingSession.id);
-                    return StatusCode(StatusCodes.Status500InternalServerError, new { message = "Không thể tạo yêu cầu trả thiết bị." });
-                }
-            }
-
-            string actionTopic = $"backend/cabinet/{requestedRoomId}/action";
-            string actionPayload = JsonConvert.SerializeObject(new
-            {
-                id = borrowingSession.id,
-                room = borrowingSession.ma_phong,
-                action = "lock"
-            });
-
-            try
-            {
-                await _mqttService.PublishAsync(actionTopic, actionPayload);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Không gửi được lệnh khóa cho phiếu {SessionId}.", borrowingSession.id);
-
-                return StatusCode(StatusCodes.Status503ServiceUnavailable, new
-                {
-                    message = "Không gửi được lệnh khóa tới tủ. Hãy thử lại.",
-                    status = borrowingSession.trang_thai
-                });
-            }
-
-            try
-            {
-                await _hubContext.Clients.All.SendAsync("CabinetStatusChanged", new
-                {
-                    roomId = requestedRoomId,
-                    isOpen = borrowingSession.is_cabinet_open ?? false,
-                    isOnline = cabinet.trang_thai_mang,
-                    lockStatus = cabinet.trang_thai_khoa,
-                    status = "Đang xác nhận trả",
-                    timestamp = DateTime.Now.ToString("HH:mm:ss")
-                });
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Không gửi được SignalR cho yêu cầu trả phiếu {SessionId}.", borrowingSession.id);
-            }
-
-            return Accepted(new
-            {
-                message = "Đã gửi yêu cầu khóa tủ. Hệ thống đang chờ ESP32 xác nhận.",
-                status = "RETURNING"
-            });
-        }
     }
 }

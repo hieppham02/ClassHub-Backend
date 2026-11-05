@@ -36,8 +36,16 @@ namespace ClassHub_API.Controllers
             [FromQuery] string? search,
             [FromQuery] string? status,
             [FromQuery] string? fromDate,
-            [FromQuery] string? toDate)
+            [FromQuery] string? toDate,
+            [FromQuery] int page = 1,
+            [FromQuery] int pageSize = 20)
         {
+            if (page < 1)
+                return BadRequest(new { message = "Số trang phải lớn hơn hoặc bằng 1." });
+
+            if (pageSize < 1 || pageSize > 100)
+                return BadRequest(new { message = "Số bản ghi mỗi trang phải từ 1 đến 100." });
+
             string? normalizedStatus = NormalizeStatus(status);
 
             if (!string.IsNullOrWhiteSpace(status) && normalizedStatus == "INVALID")
@@ -115,8 +123,17 @@ namespace ClassHub_API.Controllers
                         && p.MaSvUyQuyenNavigation.ho_ten.Contains(keyword)));
             }
 
+            int totalItems = await query.CountAsync();
+            int totalPages = (int)Math.Ceiling(totalItems / (double)pageSize);
+
+            if (totalPages > 0 && page > totalPages)
+                page = totalPages;
+
             var borrowingSessions = await query
                 .OrderByDescending(p => p.thoi_gian_tao)
+                .ThenByDescending(p => p.id)
+                .Skip((page - 1) * pageSize)
+                .Take(pageSize)
                 .ToListAsync();
 
             var result = borrowingSessions.Select(session =>
@@ -156,6 +173,79 @@ namespace ClassHub_API.Controllers
                     createdAt = session.thoi_gian_tao.ToString("dd/MM/yyyy HH:mm:ss")
                 };
             });
+
+            return Ok(new
+            {
+                items = result,
+                pagination = new
+                {
+                    page,
+                    pageSize,
+                    totalItems,
+                    totalPages
+                }
+            });
+        }
+
+        [HttpGet("statistics")]
+        public async Task<IActionResult> GetStatisticsSource(
+            [FromQuery] string? fromDate,
+            [FromQuery] string? toDate)
+        {
+            DateTime? startDate = null;
+            DateTime? endDate = null;
+
+            if (!string.IsNullOrWhiteSpace(fromDate))
+            {
+                if (!TryParseDate(fromDate, out DateTime parsedStartDate))
+                    return BadRequest(new { message = "Ngày bắt đầu không hợp lệ." });
+                startDate = parsedStartDate.Date;
+            }
+
+            if (!string.IsNullOrWhiteSpace(toDate))
+            {
+                if (!TryParseDate(toDate, out DateTime parsedEndDate))
+                    return BadRequest(new { message = "Ngày kết thúc không hợp lệ." });
+                endDate = parsedEndDate.Date;
+            }
+
+            if (startDate.HasValue && endDate.HasValue && startDate > endDate)
+                return BadRequest(new { message = "Ngày bắt đầu không được lớn hơn ngày kết thúc." });
+
+            var query = _context.phieu_muon
+                .AsNoTracking()
+                .Include(p => p.MaPhongNavigation)
+                .Include(p => p.MaSvNavigation)
+                .AsQueryable();
+
+            if (startDate.HasValue)
+                query = query.Where(p => p.ngay_muon >= startDate.Value);
+
+            if (endDate.HasValue)
+            {
+                DateTime exclusiveEndDate = endDate.Value.AddDays(1);
+                query = query.Where(p => p.ngay_muon < exclusiveEndDate);
+            }
+
+            var sessions = await query
+                .OrderBy(p => p.ngay_muon)
+                .ThenBy(p => p.id)
+                .ToListAsync();
+
+            var result = sessions.Select(session => new
+                {
+                    id = session.id,
+                    room = session.MaPhongNavigation != null
+                        ? session.MaPhongNavigation.ten_phong
+                        : session.ma_phong,
+                    slot = $"Ca {session.ca_muon}",
+                    date = session.ngay_muon.ToString("yyyy-MM-dd"),
+                    borrower = session.MaSvNavigation != null
+                        ? session.MaSvNavigation.ho_ten
+                        : session.ma_sv,
+                    borrowerId = session.ma_sv,
+                    status = session.trang_thai == "ACTIVE" ? "IN_USE" : session.trang_thai
+                });
 
             return Ok(result);
         }

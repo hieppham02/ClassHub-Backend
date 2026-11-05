@@ -17,6 +17,8 @@ namespace ClassHub_API.Services
         private readonly ConcurrentDictionary<string, Action<string, string>> _subscriptions = new();
 
         private int _isReconnecting;
+        private readonly ConcurrentDictionary<string, bool> _acknowledged = new();
+        public bool IsReady => _mqttClient.IsConnected && new[] { "iot/cabinet/+/qr-result", "iot/cabinet/+/status", "iot/cabinet/+/heartbeat", "iot/node/+/telemetry" }.All(t => _acknowledged.ContainsKey(t));
 
         public MqttService(IConfiguration configuration, ILogger<MqttService> logger)
         {
@@ -142,6 +144,7 @@ namespace ClassHub_API.Services
         {
             _mqttClient.UseDisconnectedHandler(async eventArgs =>
             {
+                _acknowledged.Clear();
                 _logger.LogWarning(eventArgs.Exception, "Mất kết nối MQTT broker.");
 
                 await ReconnectAsync();
@@ -157,7 +160,7 @@ namespace ClassHub_API.Services
 
             try
             {
-                while (!_mqttClient.IsConnected)
+                while (!_mqttClient.IsConnected || _subscriptions.Keys.Any(t => !_acknowledged.ContainsKey(t)))
                 {
                     try
                     {
@@ -195,7 +198,12 @@ namespace ClassHub_API.Services
                 .WithAtLeastOnceQoS()
                 .Build();
 
-            await _mqttClient.SubscribeAsync(topicFilter);
+            var result = await _mqttClient.SubscribeAsync(topicFilter);
+            if (result.Items.Count == 0 || result.Items.Any(i => (int)i.ResultCode >= 128)) {
+                _acknowledged.TryRemove(topic, out _);
+                throw new InvalidOperationException("Broker rejected MQTT subscription.");
+            }
+            _acknowledged[topic] = true;
         }
 
         private static bool TopicMatches(

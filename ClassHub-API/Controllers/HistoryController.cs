@@ -1,13 +1,11 @@
-﻿using ClassHub_API.Data;
+using ClassHub_API.Data;
 using ClassHub_API.DTOs;
 using ClassHub_API.Models;
 using ClassHub_API.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
-using Newtonsoft.Json;
 using System.Security.Claims;
-using System.Security.Cryptography;
 
 namespace ClassHub_API.Controllers
 {
@@ -19,14 +17,10 @@ namespace ClassHub_API.Controllers
         private static readonly string[] ActiveStatuses = { "PENDING", "ACTIVE", "IN_USE" };
 
         private readonly AppDbContext _context;
-        private readonly IMqttService _mqttService;
-        private readonly ILogger<HistoryController> _logger;
 
-        public HistoryController(AppDbContext context, IMqttService mqttService, ILogger<HistoryController> logger)
+        public HistoryController(AppDbContext context)
         {
             _context = context;
-            _mqttService = mqttService;
-            _logger = logger;
         }
 
         [HttpGet("get-history")]
@@ -69,7 +63,7 @@ namespace ClassHub_API.Controllers
                     borrowingSession.thoi_gian_tra,
                     BorrowerName = borrower != null ? borrower.ho_ten : borrowingSession.ma_sv,
                     ReturnerName = returner != null ? returner.ho_ten : borrowingSession.ma_sv_tra,
-                    borrowingSession.is_cabinet_open
+                    borrowingSession.is_cabinet_open, borrowingSession.QrEnabled, borrowingSession.QrPhase
                 }).ToListAsync();
 
             var history = rawData.Select(item => new
@@ -85,104 +79,11 @@ namespace ClassHub_API.Controllers
                 returnerName = item.ReturnerName,
                 createdAt = item.thoi_gian_tao.ToString("HH:mm"),
                 returnedAt = item.thoi_gian_tra?.ToString("HH:mm") ?? "---",
-                isCabinetOpen = item.is_cabinet_open == true
+                isCabinetOpen = item.is_cabinet_open == true,
+                qrEnabled = item.QrEnabled, qrPhase = item.QrPhase
             }).ToList();
 
             return Ok(history);
-        }
-
-        [HttpPost("refresh-otp/{id:int}")]
-        public async Task<IActionResult> RefreshOtp(int id)
-        {
-            string? currentUserId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
-
-            if (string.IsNullOrWhiteSpace(currentUserId))
-            {
-                return Unauthorized(new { message = "Không xác định được người dùng." });
-            }
-
-            var borrowingSession = await _context.phieu_muon.FirstOrDefaultAsync(session =>
-                session.id == id &&
-                (session.ma_sv == currentUserId || session.ma_sv_uy_quyen == currentUserId));
-
-            if (borrowingSession == null)
-            {
-                return NotFound(new { message = "Không tìm thấy phiếu mượn hoặc bạn không có quyền cấp lại OTP." });
-            }
-
-            if (!ActiveStatuses.Contains(borrowingSession.trang_thai))
-            {
-                return Conflict(new { message = "Phiếu mượn không còn ở trạng thái cấp OTP." });
-            }
-
-            var cabinet = await _context.thiet_bi_iot.FirstOrDefaultAsync(item => item.ma_phong == borrowingSession.ma_phong);
-
-            if (cabinet == null)
-            {
-                return NotFound(new { message = "Phòng này chưa được gán tủ." });
-            }
-
-            if (!cabinet.trang_thai_mang)
-            {
-                return StatusCode(StatusCodes.Status503ServiceUnavailable, new
-                {
-                    message = "Tủ đang ngoại tuyến nên chưa thể cấp OTP."
-                });
-            }
-
-            if (cabinet.trang_thai_khoa == "ERROR")
-            {
-                return Conflict(new { message = "Tủ đang gặp lỗi hoặc được bảo trì." });
-            }
-
-            string newOtp = RandomNumberGenerator.GetInt32(100000, 1000000).ToString();
-            DateTime expiresAt = DateTime.Now.AddMinutes(3);
-
-            borrowingSession.otp = newOtp;
-            borrowingSession.otp_expires_at = expiresAt;
-
-            _context.nhat_ky_he_thong.Add(new NhatKyHeThong
-            {
-                ma_sv = currentUserId,
-                hanh_dong = "CAP_LAI_OTP",
-                chi_tiet = $"Cấp lại OTP cho phiếu #{borrowingSession.id}, phòng {borrowingSession.ma_phong}",
-                thoi_gian = DateTime.Now,
-                ip_address = Helper.GetClientIp(HttpContext),
-                user_agent = Helper.GetClientOs(Request)
-            });
-
-            await _context.SaveChangesAsync();
-
-            string topic = $"backend/cabinet/{borrowingSession.ma_phong}/otp";
-
-            var otpPayload = new
-            {
-                id = borrowingSession.id.ToString(),
-                room = borrowingSession.ma_phong,
-                otp = newOtp
-            };
-
-            string payload = JsonConvert.SerializeObject(otpPayload);
-
-            try
-            {
-                await _mqttService.PublishAsync(topic, payload);
-            }
-            catch (Exception exception)
-            {
-                _logger.LogError(exception, "Không thể gửi OTP tới tủ phòng {RoomId}", borrowingSession.ma_phong);
-
-                return StatusCode(StatusCodes.Status503ServiceUnavailable, new
-                {
-                    message = "OTP đã được tạo nhưng chưa gửi được tới tủ. Vui lòng thử cấp lại."
-                });
-            }
-
-            return Ok(new
-            {
-                message = "Đã cấp mã OTP mới.",
-                expiresAt
-            });
         }
 
         [HttpPost("delegate/{id:int}")]

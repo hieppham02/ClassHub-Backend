@@ -1,4 +1,4 @@
-﻿using ClassHub_API.Data;
+using ClassHub_API.Data;
 using ClassHub_API.DTOs;
 using ClassHub_API.Models;
 using ClassHub_API.Services;
@@ -37,7 +37,7 @@ namespace ClassHub_API.Controllers
                     id = building.ma_toa_nha,
                     name = building.ten_toa_nha,
                     floors = building.so_tang ?? 1,
-                    rooms = building.PhongHocs.Count,
+                    rooms = building.PhongHocs.Count(r => r.LocationType == "ROOM"),
                     description = building.mo_ta ?? string.Empty
                 })
                 .ToListAsync();
@@ -230,6 +230,7 @@ namespace ClassHub_API.Controllers
                 .ToDictionaryAsync(cabinet => cabinet.ma_phong!);
 
             var rooms = await _context.phong_hoc
+                .Where(room => room.LocationType == "ROOM")
                 .AsNoTracking()
                 .Include(room => room.MaToaNhaNavigation)
                 .OrderBy(room => room.ma_toa_nha)

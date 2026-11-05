@@ -28,3 +28,14 @@ README.md
 !.git/config
 !.git/packed-refs
 !.git/refs/heads/**
+
+# Local builds and environment-specific configuration are not runtime inputs.
+**/.git
+**/.codex-temp
+**/.env.*
+**/appsettings.Development.json
+**/appsettings.Local.json
+**/appsettings.Production.json
+**/*.sql
+**/*.pem
+**/*.pfx

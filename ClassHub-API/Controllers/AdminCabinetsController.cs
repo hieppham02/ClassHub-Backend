@@ -1,4 +1,4 @@
-﻿using ClassHub_API.Data;
+using ClassHub_API.Data;
 using ClassHub_API.Hubs;
 using ClassHub_API.Models;
 using ClassHub_API.Services;
@@ -56,6 +56,8 @@ namespace ClassHub_API.Controllers
                 .GroupBy(p => p.ma_phong)
                 .ToDictionary(group => group.Key, group => group.First());
 
+            var healthRows = await _context.CabinetHealths.AsNoTracking().ToDictionaryAsync(h => h.RoomId);
+            var blockedRooms = await AllocationPolicy.BlockedRooms(_context);
             var result = cabinets.Select(cabinet =>
             {
                 string roomId = cabinet.ma_phong ?? "---";
@@ -64,8 +66,10 @@ namespace ClassHub_API.Controllers
 
                 currentBookings.TryGetValue(roomId, out PhieuMuon? currentBooking);
 
+                healthRows.TryGetValue(roomId, out var healthRow);
+                var health = CabinetHealthService.View(healthRow, DateTime.UtcNow);
                 bool isUnlocked = cabinet.trang_thai_khoa == "UNLOCKED";
-                string status = GetCabinetDisplayStatus(cabinet, room?.trang_thai, currentBooking);
+                string status = blockedRooms.Contains(roomId) ? "Bảo trì" : GetCabinetDisplayStatus(cabinet, room?.trang_thai, currentBooking);
 
                 return new
                 {
@@ -77,10 +81,14 @@ namespace ClassHub_API.Controllers
                     floor = $"Tầng {room?.tang ?? 1}",
                     macAddress = cabinet.mac_address,
                     mqttTopic = cabinet.mqtt_topic,
+                    deviceId = CabinetAddress.DeviceId(cabinet),
+                    commandTopic = CabinetAddress.DeviceId(cabinet) is string deviceId ? $"backend/cabinet/{deviceId}/action" : null,
+                    heartbeatTopic = CabinetAddress.DeviceId(cabinet) is string heartbeatId ? $"iot/cabinet/{heartbeatId}/heartbeat" : null,
                     isOnline = cabinet.trang_thai_mang,
                     status,
-                    doorCondition = isUnlocked ? "Mở" : "Đóng",
-                    isDoorOpen = isUnlocked,
+                    health, allocationBlocked = blockedRooms.Contains(roomId),
+                    doorCondition = health?.Metrics.DoorOpen is bool open ? open ? "Mở" : "Đóng" : "Chưa có dữ liệu cảm biến",
+                    isDoorOpen = health?.Metrics.DoorOpen ?? isUnlocked,
                     lockStatus = cabinet.trang_thai_khoa,
                     borrower = currentBooking?.MaSvNavigation != null
                         ? $"{currentBooking.MaSvNavigation.ho_ten} ({currentBooking.ma_sv})"
@@ -102,6 +110,7 @@ namespace ClassHub_API.Controllers
 
             var cabinet = await _context.thiet_bi_iot
                 .AsNoTracking()
+                .Include(c => c.MaPhongNavigation)
                 .FirstOrDefaultAsync(c => c.id == id);
 
             if (cabinet == null) return NotFound(new { message = "Không tìm thấy tủ IoT." });
@@ -111,7 +120,7 @@ namespace ClassHub_API.Controllers
             if (!cabinet.trang_thai_mang)
                 return BadRequest(new { message = "Tủ đang offline. Không thể gửi lệnh mở." });
 
-            if (cabinet.trang_thai_khoa == "ERROR")
+            if (cabinet.trang_thai_khoa == "ERROR" || cabinet.MaPhongNavigation?.trang_thai is "BAO_TRI" or "TAM_KHOA")
                 return BadRequest(new { message = "Tủ đang gặp lỗi hoặc bảo trì." });
 
             var activeBooking = await _context.phieu_muon
@@ -135,11 +144,14 @@ namespace ClassHub_API.Controllers
                 return StatusCode(StatusCodes.Status500InternalServerError, new { message = "Không thể ghi nhận yêu cầu mở tủ." });
             }
 
-            string topic = $"backend/cabinet/{cabinet.ma_phong}/action";
+            string deviceId;
+            try { deviceId = await CabinetAddress.ForRoom(_context, cabinet.ma_phong); }
+            catch (InvalidOperationException) { return Conflict(new { message = "Mã MQTT của tủ không hợp lệ hoặc bị trùng." }); }
+            string topic = $"backend/cabinet/{deviceId}/action";
             string payload = JsonConvert.SerializeObject(new
             {
                 id = activeBooking?.id.ToString() ?? "0",
-                room = cabinet.ma_phong,
+                room = deviceId,
                 action = "open",
                 ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
             });
@@ -173,6 +185,7 @@ namespace ClassHub_API.Controllers
 
             var cabinet = await _context.thiet_bi_iot
                 .AsNoTracking()
+                .Include(c => c.MaPhongNavigation)
                 .FirstOrDefaultAsync(c => c.id == id);
 
             if (cabinet == null) return NotFound(new { message = "Không tìm thấy tủ IoT." });
@@ -182,7 +195,7 @@ namespace ClassHub_API.Controllers
             if (!cabinet.trang_thai_mang)
                 return BadRequest(new { message = "Tủ đang offline. Không thể gửi lệnh khóa." });
 
-            if (cabinet.trang_thai_khoa == "ERROR")
+            if (cabinet.trang_thai_khoa == "ERROR" || cabinet.MaPhongNavigation?.trang_thai is "BAO_TRI" or "TAM_KHOA")
                 return BadRequest(new { message = "Tủ đang gặp lỗi hoặc bảo trì." });
 
             var activeBooking = await _context.phieu_muon
@@ -206,11 +219,14 @@ namespace ClassHub_API.Controllers
                 return StatusCode(StatusCodes.Status500InternalServerError, new { message = "Không thể ghi nhận yêu cầu khóa tủ." });
             }
 
-            string topic = $"backend/cabinet/{cabinet.ma_phong}/action";
+            string deviceId;
+            try { deviceId = await CabinetAddress.ForRoom(_context, cabinet.ma_phong); }
+            catch (InvalidOperationException) { return Conflict(new { message = "Mã MQTT của tủ không hợp lệ hoặc bị trùng." }); }
+            string topic = $"backend/cabinet/{deviceId}/action";
             string payload = JsonConvert.SerializeObject(new
             {
                 id = activeBooking?.id.ToString() ?? "0",
-                room = cabinet.ma_phong,
+                room = deviceId,
                 action = "lock",
                 ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
             });
@@ -235,13 +251,19 @@ namespace ClassHub_API.Controllers
             });
         }
 
+        public class MaintenanceRequest {
+            public bool VerifiedReady { get; set; }
+            public string? Note { get; set; }
+        }
         [HttpPatch("{id:int}/toggle-maintenance")]
-        public async Task<IActionResult> ToggleMaintenance(int id)
+        public async Task<IActionResult> ToggleMaintenance(int id,
+            [FromBody(EmptyBodyBehavior = Microsoft.AspNetCore.Mvc.ModelBinding.EmptyBodyBehavior.Allow)] MaintenanceRequest? request = null)
         {
             string? adminId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
             if (string.IsNullOrWhiteSpace(adminId))
                 return Unauthorized(new { message = "Không xác định được quản trị viên." });
 
+            await using var maintenanceTransaction = await _context.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);
             var cabinet = await _context.thiet_bi_iot
                 .Include(c => c.MaPhongNavigation)
                 .FirstOrDefaultAsync(c => c.id == id);
@@ -251,17 +273,34 @@ namespace ClassHub_API.Controllers
             var room = cabinet.MaPhongNavigation;
             if (room == null) return BadRequest(new { message = "Không tìm thấy phòng học của tủ." });
 
-            bool enableMaintenance = room.trang_thai != "BAO_TRI";
+            var blocked = await AllocationPolicy.IsBlocked(_context, room.ma_phong);
+            bool enableMaintenance = room.trang_thai != "BAO_TRI" && cabinet.trang_thai_khoa != "ERROR" && !blocked;
+            if (await _context.phieu_muon.AnyAsync(s => s.ma_phong == room.ma_phong &&
+                (s.trang_thai == "ACTIVE" || s.trang_thai == "IN_USE" || s.trang_thai == "RETURNING" || s.is_cabinet_open == true ||
+                 s.QrPhase == "RECEIVE_OPEN_REQUESTED" || s.QrPhase == "RECEIVE_UNLOCKED")))
+                return Conflict(new { message = "Hoàn tất phiên đang thao tác/mượn/trả trước khi đổi chế độ bảo trì." });
+            if (!enableMaintenance) {
+                if (blocked) return Conflict(new { message = "Còn sự cố chặn cấp phát. Xử lý và gỡ chặn trong Quản lý tài sản trước." });
+                if (request?.VerifiedReady != true || string.IsNullOrWhiteSpace(request.Note) || request.Note.Trim().Length is < 3 or > 1000)
+                    return BadRequest(new { message = "Cần xác nhận đã kiểm tra sẵn sàng và ghi kết quả trước khi khôi phục." });
+                var health = await _context.CabinetHealths.AsNoTracking().FirstOrDefaultAsync(h => h.RoomId == room.ma_phong);
+                if (!cabinet.trang_thai_mang || cabinet.trang_thai_khoa == "UNLOCKED" || CabinetHealthService.View(health, DateTime.UtcNow)?.Metrics.DoorOpen == true)
+                    return Conflict(new { message = "Tủ phải online, cửa đóng và chốt không mở trước khi khôi phục." });
+                if (await _context.thiet_bi.AnyAsync(e => e.ma_phong == room.ma_phong && e.UsageScope == "CABINET" && e.so_luong > 0 && e.tinh_trang != "TOT"))
+                    return Conflict(new { message = "Còn thiết bị chưa được xác nhận tốt." });
+                if (cabinet.trang_thai_khoa == "ERROR") cabinet.trang_thai_khoa = "LOCKED";
+            }
             room.trang_thai = enableMaintenance ? "BAO_TRI" : "HOAT_DONG";
 
             AddAuditLog(
                 adminId,
                 enableMaintenance ? "BAT_BAO_TRI_TU" : "TAT_BAO_TRI_TU",
-                $"{(enableMaintenance ? "Bật" : "Tắt")} chế độ bảo trì tủ {cabinet.ten_tu}, phòng {cabinet.ma_phong}.");
+                $"{(enableMaintenance ? "Bật" : "Tắt")} chế độ bảo trì tủ {cabinet.ten_tu}, phòng {cabinet.ma_phong}. {request?.Note?.Trim()}");
 
             try
             {
                 await _context.SaveChangesAsync();
+                await maintenanceTransaction.CommitAsync();
             }
             catch (Exception ex)
             {

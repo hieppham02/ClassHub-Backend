@@ -1,4 +1,4 @@
-﻿using ClassHub_API.Data;
+using ClassHub_API.Data;
 using ClassHub_API.Hubs;
 using ClassHub_API.Interfaces;
 using ClassHub_API.Services;
@@ -14,6 +14,14 @@ namespace ClassHub_API
         public static void Main(string[] args)
         {
             var builder = WebApplication.CreateBuilder(args);
+            var secretsFile = Environment.GetEnvironmentVariable("CLASSHUB_SECRETS_FILE");
+            if (!string.IsNullOrEmpty(secretsFile)) {
+                if (!Path.IsPathFullyQualified(secretsFile)) throw new InvalidOperationException("CLASSHUB_SECRETS_FILE must be absolute.");
+                builder.Configuration.AddJsonFile(secretsFile, optional:false, reloadOnChange:false)
+                    .AddEnvironmentVariables().AddCommandLine(args);
+            }
+            var logPath = builder.Configuration["Logging:FileDirectory"];
+            if (!string.IsNullOrWhiteSpace(logPath)) builder.Logging.AddProvider(new RollingFileLogger(logPath, builder.Configuration));
 
             string connectionString =
                 builder.Configuration.GetConnectionString("DefaultConnection")
@@ -46,7 +54,7 @@ namespace ClassHub_API
             builder.Services.AddEndpointsApiExplorer();
             builder.Services.AddSwaggerGen();
             builder.Services.AddProblemDetails();
-            builder.Services.AddHealthChecks();
+            builder.Services.AddHealthChecks().AddCheck<ReadinessCheck>("dependencies", timeout:TimeSpan.FromSeconds(5), tags:new[] { "ready" });
             builder.Services.AddSignalR();
 
             builder.Services.AddDbContext<AppDbContext>(options =>
@@ -102,6 +110,14 @@ namespace ClassHub_API
                 };
             });
 
+            builder.Services.AddScoped<QrAccessService>();
+            builder.Services.AddSingleton<CabinetCamera>();
+            builder.Services.AddHttpClient("return-vision").ConfigurePrimaryHttpMessageHandler(() =>
+                new HttpClientHandler { AllowAutoRedirect = false });
+            builder.Services.AddScoped<ReturnInspectionService>();
+            builder.Services.AddScoped<BatteryAssessmentService>();
+            builder.Services.AddHostedService<ReturnInspectionWorker>();
+            builder.Services.AddHostedService<OperationRulesWorker>();
             builder.Services.AddAuthorization();
 
             builder.Services.AddCors(options =>
@@ -136,7 +152,7 @@ namespace ClassHub_API
                 });
             });
 
-            builder.WebHost.UseUrls("http://0.0.0.0:5146");
+            if (string.IsNullOrWhiteSpace(builder.Configuration["urls"])) builder.WebHost.UseUrls("http://0.0.0.0:5146");
 
             var app = builder.Build();
 
@@ -155,7 +171,8 @@ namespace ClassHub_API
 
             app.MapControllers();
             app.MapHub<CabinetHub>("/hub/cabinet");
-            app.MapHealthChecks("/health");
+            app.MapHealthChecks("/health", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions { Predicate = _ => false });
+            app.MapHealthChecks("/health/ready", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions { Predicate = r => r.Tags.Contains("ready") });
 
             app.Run();
         }

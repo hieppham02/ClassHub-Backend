@@ -1,20 +1,20 @@
-﻿using System;
+using System;
 using System.ComponentModel.DataAnnotations;
 using System.ComponentModel.DataAnnotations.Schema;
 
 namespace ClassHub_API.Models
 {
-    [Table("thiet_bi_iot")]
+    [Table("cabinet")]
     public class ThietBiIot
     {
         [Key]
         [Column("id")]
         public int id { get; set; }
 
-        [Column("ma_phong")]
+        [Column("room_id")]
         public string? ma_phong { get; set; }
 
-        [Column("ten_tu")]
+        [Column("name")]
         public string ten_tu { get; set; } = null!;
 
         [Column("mac_address")]
@@ -23,16 +23,16 @@ namespace ClassHub_API.Models
         [Column("mqtt_topic")]
         public string mqtt_topic { get; set; } = null!;
 
-        [Column("trang_thai_mang")]
+        [Column("is_online")]
         public bool trang_thai_mang { get; set; } = false;
 
-        [Column("trang_thai_khoa")]
+        [Column("lock_state")]
         public string trang_thai_khoa { get; set; } = "LOCKED";
 
         [Column("firmware_version")]
         public string? firmware_version { get; set; } = "v1.0.0";
 
-        [Column("lan_cuoi_online")]
+        [Column("last_seen_at")]
         public DateTime? lan_cuoi_online { get; set; }
 
         [ForeignKey("ma_phong")]
