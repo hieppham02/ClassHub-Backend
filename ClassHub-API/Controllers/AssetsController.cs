@@ -11,7 +11,7 @@ using System.Text.Json;
 namespace ClassHub_API.Controllers;
 
 [ApiController, Authorize(Roles = "ADMIN"), Route("api/admin/assets")]
-public class AssetsController(AppDbContext context, IConfiguration configuration) : ControllerBase
+public class AssetsController(AppDbContext context, IConfiguration configuration, IotAnomalyModel? anomalyModel = null) : ControllerBase
 {
     private static readonly string[] Conditions = ["TOT", "HONG", "DANG_BAO_TRI", "NGUNG_SU_DUNG"];
     private object Item(ThietBi e) => new { e.id, name=e.ten_thiet_bi, quantity=e.so_luong, condition=e.tinh_trang,
@@ -39,7 +39,8 @@ public class AssetsController(AppDbContext context, IConfiguration configuration
             bool online=n.Status=="ONLINE" && last.HasValue
                 && (now-DateTime.SpecifyKind(last.Value,DateTimeKind.Utc)).TotalSeconds<=Math.Max(90,n.PublishIntervalSeconds*3);
             return new { n.Id, n.NodeCode, n.RoomId, n.Name, n.DataSource, status=n.Status=="DISABLED"?"DISABLED":online?"ONLINE":"OFFLINE", lastSeenAt=last,
-                n.PublishIntervalSeconds, n.BootSequence, n.LastBootId, n.LastSequence, readings=Readings(measurement?.ReadingsJson) };
+                n.PublishIntervalSeconds, n.BootSequence, n.LastBootId, n.LastSequence,
+                needsAttention=online && IotAttention.Check(measurement?.ReadingsJson,n.DataSource,anomalyModel), readings=Readings(measurement?.ReadingsJson) };
         }) });
     }
 

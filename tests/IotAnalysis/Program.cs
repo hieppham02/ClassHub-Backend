@@ -32,4 +32,13 @@ Check(parsed.Demo!.Context=="AFTER_USE","Only context is consumed from demo meta
 var restored=JsonSerializer.Deserialize<List<SensorReading>>(JsonSerializer.Serialize(new[]{new SensorReading("current","A",1,"GOOD","AFTER_USE")},NodeTelemetry.Json),NodeTelemetry.Json)!;
 Check(restored[0].UsageContext=="AFTER_USE","Usage context survives stored JSON roundtrip");
 Check(typeof(IotAnalysisController).GetCustomAttributes(typeof(AuthorizeAttribute),false).Cast<AuthorizeAttribute>().Single().Roles=="ADMIN","Analysis is admin-only");
+string Data(double temp,double humidity,double amperes,string quality="GOOD",string? usage="AFTER_USE")=>JsonSerializer.Serialize(new[]{new SensorReading("temperature","C",temp,quality),new SensorReading("humidity","%",humidity,quality),new SensorReading("current","A",amperes,quality,usage)},NodeTelemetry.Json);
+Check(IotAttention.Check(Data(36,60,.08),"REAL",model),"Overview flags high temperature");
+Check(IotAttention.Check(Data(28,80,.08),"REAL",model),"Overview flags high humidity");
+Check(IotAttention.Check(Data(28,60,12),"MOCK",model),"Overview flags AI residual load");
+Check(!IotAttention.Check(Data(28,60,12,usage:"IN_USE"),"MOCK",model),"Occupied room is excluded from residual-load warning");
+Check(!IotAttention.Check(Data(28,60,12),"REAL",model),"Physical nodes cannot take usage context from payload");
+Check(!IotAttention.Check(Data(41,90,12,"ERROR"),"MOCK",model),"Bad-quality readings cannot flag room");
+Check(!IotAttention.Check("{broken","MOCK",model),"Malformed JSON is safe");
+Check(!IotAttention.Check(null,"MOCK",model),"Missing telemetry is safe");
 Console.WriteLine($"PASS {count} checks; no DB connection or MQTT publish.");
