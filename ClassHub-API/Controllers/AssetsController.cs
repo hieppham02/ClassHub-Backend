@@ -30,17 +30,22 @@ public class AssetsController(AppDbContext context, IConfiguration configuration
         var latestRows = await LatestNodeSamples.Query(context.IotSensors.AsNoTracking())
             .Select(s=>new {s.NodeId,s.DataSource,s.ReceivedAt,s.ReadingsJson}).ToListAsync();
         var latest=latestRows.ToDictionary(s=>(s.NodeId,s.DataSource));
+        var activeRooms=(await context.phieu_muon.AsNoTracking().Where(s=>s.thoi_gian_nhan!=null &&
+            new[]{"ACTIVE","IN_USE","RETURNING"}.Contains(s.trang_thai)).Select(s=>s.ma_phong).Distinct().ToListAsync()).ToHashSet();
+        var returnedRooms=(await context.phieu_muon.AsNoTracking().Where(s=>s.trang_thai=="COMPLETED" && s.thoi_gian_tra!=null)
+            .Select(s=>s.ma_phong).Distinct().ToListAsync()).ToHashSet();
         var now=DateTime.UtcNow;
         var catalogs=await context.EquipmentCatalogs.AsNoTracking().OrderBy(c=>c.Name).ToListAsync();
         return Ok(new { rooms, catalogs, equipment=equipment.Select(Item), nodes=nodes.Select(n=> {
             latest.TryGetValue((n.Id,n.DataSource),out var measurement);
+            var usage=IotRoomUsage.Resolve(n.DataSource,measurement?.ReadingsJson,activeRooms.Contains(n.RoomId),returnedRooms.Contains(n.RoomId));
             var last=n.LastSeenAt ?? measurement?.ReceivedAt;
             // MQTT test nodes expire like physical nodes; historical mock samples cannot imply live connectivity.
             bool online=n.Status=="ONLINE" && last.HasValue
                 && (now-DateTime.SpecifyKind(last.Value,DateTimeKind.Utc)).TotalSeconds<=Math.Max(90,n.PublishIntervalSeconds*3);
             return new { n.Id, n.NodeCode, n.RoomId, n.Name, n.DataSource, status=n.Status=="DISABLED"?"DISABLED":online?"ONLINE":"OFFLINE", lastSeenAt=last,
                 n.PublishIntervalSeconds, n.BootSequence, n.LastBootId, n.LastSequence,
-                needsAttention=online && IotAttention.Check(measurement?.ReadingsJson,n.DataSource,anomalyModel), readings=Readings(measurement?.ReadingsJson) };
+                usageContext=usage, isInUse=usage=="IN_USE", needsAttention=online && IotAttention.Check(measurement?.ReadingsJson,n.DataSource,anomalyModel,usage), readings=Readings(measurement?.ReadingsJson) };
         }) });
     }
 
