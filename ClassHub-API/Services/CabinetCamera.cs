@@ -13,6 +13,56 @@ public class CabinetCamera(IConfiguration config)
 {
     public const int MaxPacketBytes = 640 * 480 * 2 + 16;
     private readonly ConcurrentDictionary<string, (string Token, DateTime Until)> sessions = new();
+    private readonly ConcurrentDictionary<string, byte> viewers = new();
+
+    public bool Configured(string room) => Uri.TryCreate(config[$"ReturnVerification:Cameras:{room}:WebSocketUrl"],UriKind.Absolute,out var u)
+        && (u.Scheme=="ws" || u.Scheme=="wss") && u.AbsolutePath=="/ws" && string.IsNullOrEmpty(u.UserInfo) && string.IsNullOrEmpty(u.Query);
+
+    public async IAsyncEnumerable<CabinetPhoto> Stream(string room,[System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct) {
+        if(!Configured(room))throw new InvalidDataException("Camera chưa được kết nối với máy chủ.");
+        if(!viewers.TryAdd(room,0))throw new InvalidDataException("Camera đang được sử dụng. Hãy thử lại sau.");
+        try {
+            var url=new Uri(config[$"ReturnVerification:Cameras:{room}:WebSocketUrl"]!);
+            using var socket=new ClientWebSocket();
+            using(var connect=CancellationTokenSource.CreateLinkedTokenSource(ct)) {
+                connect.CancelAfter(TimeSpan.FromSeconds(12));
+                var auth=await Session(room,url,connect.Token);
+                await socket.ConnectAsync(url,connect.Token);
+                if(auth!=null)await Send(socket,"AUTH "+auth,connect.Token);
+                await Send(socket,"FORMAT JPEG",connect.Token);
+            }
+            try {
+                var buffer=new byte[16384];
+                while(!ct.IsCancellationRequested) {
+                    using var timeout=CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    timeout.CancelAfter(TimeSpan.FromSeconds(12));
+                    await Send(socket,"NEXT",timeout.Token);
+                    CabinetPhoto? photo=null;
+                    for(var n=0;n<8 && photo==null;n++) {
+                        using var packet=new MemoryStream();
+                        WebSocketReceiveResult part;
+                        do {
+                            part=await socket.ReceiveAsync(new ArraySegment<byte>(buffer),timeout.Token);
+                            if(part.MessageType==WebSocketMessageType.Close)throw new InvalidDataException("Camera đã ngắt kết nối.");
+                            if(packet.Length+part.Count>MaxPacketBytes)throw new InvalidDataException("Ảnh camera vượt dung lượng cho phép.");
+                            packet.Write(buffer,0,part.Count);
+                        }while(!part.EndOfMessage);
+                        if(part.MessageType==WebSocketMessageType.Binary)photo=Decode(packet.ToArray());
+                    }
+                    if(photo==null)throw new InvalidDataException("Không nhận được ảnh camera.");
+                    yield return photo;
+                }
+            } finally {
+                using var close=new CancellationTokenSource(TimeSpan.FromSeconds(1));
+                try {await socket.CloseAsync(WebSocketCloseStatus.NormalClosure,"viewer closed",close.Token);}
+                catch {socket.Abort();}
+            }
+        } finally {viewers.TryRemove(room,out _);}
+    }
+
+    static Task Send(ClientWebSocket socket,string command,CancellationToken ct) =>
+        socket.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(command)),WebSocketMessageType.Text,true,ct);
+
 
     private async Task<string?> Session(string room, Uri cameraUrl, CancellationToken ct)
     {
@@ -46,7 +96,13 @@ public class CabinetCamera(IConfiguration config)
         return new(packet[16..], BinaryPrimitives.ReadUInt32LittleEndian(packet.AsSpan(8)));
     }
 
-    public async Task<CabinetPhoto> Capture(string room, CancellationToken cancellation)
+    public async Task<CabinetPhoto> Capture(string room, CancellationToken cancellation) {
+        if(!viewers.TryAdd(room,0))throw new InvalidDataException("Camera đang được sử dụng. Hãy đóng trình xem và thử lại.");
+        try {return await CaptureOne(room,cancellation);}
+        finally {viewers.TryRemove(room,out _);}
+    }
+
+    private async Task<CabinetPhoto> CaptureOne(string room, CancellationToken cancellation)
     {
         var address = config[$"ReturnVerification:Cameras:{room}:WebSocketUrl"];
         if (!Uri.TryCreate(address, UriKind.Absolute, out var url) ||

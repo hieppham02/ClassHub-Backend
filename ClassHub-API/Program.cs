@@ -116,6 +116,7 @@ namespace ClassHub_API
                 new HttpClientHandler { AllowAutoRedirect = false });
             builder.Services.AddScoped<ReturnInspectionService>();
             builder.Services.AddScoped<BatteryAssessmentService>();
+            builder.Services.AddSingleton<RfidEnrollmentTokens>();
             builder.Services.AddHostedService<ReturnInspectionWorker>();
             builder.Services.AddHostedService<OperationRulesWorker>();
             builder.Services.AddAuthorization();

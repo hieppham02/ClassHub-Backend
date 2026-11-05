@@ -22,6 +22,8 @@ public class CabinetHealthPayload
     public long? PsramFree { get; set; }
     public bool? ReaderInitialized { get; set; }
     public long? LastRfidScanAgeMs { get; set; }
+    public string? LastRfidUid { get; set; }
+    public long? RfidScanSequence { get; set; }
     public bool? CameraRecentFrame { get; set; }
     public long? CameraFrameAgeMs { get; set; }
     public int? CameraFps100 { get; set; }
@@ -48,6 +50,8 @@ public static class CabinetHealthService
         (p.CameraFps100 == null || p.CameraFps100 is >= 0 and <= 100000) &&
         (p.CameraFrameAgeMs == null || p.CameraFrameAgeMs is >= -1 and <= 9007199254740991) &&
         (p.LastRfidScanAgeMs == null || p.LastRfidScanAgeMs is >= -1 and <= 9007199254740991) &&
+        ((p.LastRfidUid == null && (p.RfidScanSequence == null || p.RfidScanSequence == 0)) ||
+            RfidSession.ValidUid(p.LastRfidUid) && p.RfidScanSequence is > 0 and <= uint.MaxValue) &&
         (p.LastError?.Length ?? 0) <= 80 && (p.CurrentError?.Length ?? 0) <= 80;
 
     public static CabinetHealthView? View(CabinetHealth? row, DateTime now)
