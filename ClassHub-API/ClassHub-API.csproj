@@ -25,7 +25,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Content Include="Models/battery_gbr.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Update="Models/battery_gbr.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <Content Update="appsettings.Development.json;appsettings.Production.json;appsettings.Local.json" CopyToPublishDirectory="Never" />
   </ItemGroup>
 </Project>
